@@ -122,6 +122,7 @@ public enum DevConsoleArchiveValidator {
               plist["CFBundleIdentifier"] as? String == DevConsoleReleasePolicy.bundleIdentifier,
               plist["CFBundleExecutable"] as? String == DevConsoleReleasePolicy.executableName,
               plist["CFBundlePackageType"] as? String == "APPL",
+              plist["CFBundleIconFile"] as? String == "DevConsole.icns",
               let version = plist["CFBundleShortVersionString"] as? String,
               let build = plist["CFBundleVersion"] as? String else {
             throw DevConsoleArchiveError.invalid("DevConsole.app 번들 정보가 올바르지 않습니다.")
@@ -137,6 +138,11 @@ public enum DevConsoleArchiveValidator {
                   (try? file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
                 throw DevConsoleArchiveError.invalid("필수 실행 파일이 없습니다: \(path)")
             }
+        }
+        let icon = app.appendingPathComponent("Contents/Resources/DevConsole.icns")
+        guard (try? icon.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
+              (try? icon.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+            throw DevConsoleArchiveError.invalid("DevConsole 앱 아이콘이 없습니다.")
         }
         let signature = try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
         guard signature.status == 0 else { throw DevConsoleArchiveError.invalid("코드 서명 검증에 실패했습니다.") }

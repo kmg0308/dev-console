@@ -19,11 +19,13 @@ let fixture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID
 let app = fixture.appendingPathComponent("DevConsole.app")
 try! FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/MacOS"), withIntermediateDirectories: true)
 try! FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/Helpers"), withIntermediateDirectories: true)
+try! FileManager.default.createDirectory(at: app.appendingPathComponent("Contents/Resources"), withIntermediateDirectories: true)
 for path in ["Contents/MacOS/DevConsole", "Contents/Helpers/runtime-atlas", "Contents/Helpers/runtime-atlas-supervisor"] {
     try! FileManager.default.copyItem(atPath: "/usr/bin/true", toPath: app.appendingPathComponent(path).path)
 }
+try! Data("icon".utf8).write(to: app.appendingPathComponent("Contents/Resources/DevConsole.icns"))
 let plist = """
-<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kmg0308.devconsole</string><key>CFBundleExecutable</key><string>DevConsole</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>1.2.0</string><key>CFBundleVersion</key><string>7</string></dict></plist>
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.kmg0308.devconsole</string><key>CFBundleExecutable</key><string>DevConsole</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleIconFile</key><string>DevConsole.icns</string><key>CFBundleShortVersionString</key><string>1.2.0</string><key>CFBundleVersion</key><string>7</string></dict></plist>
 """
 try! plist.write(to: app.appendingPathComponent("Contents/Info.plist"), atomically: true, encoding: .utf8)
 _ = try! DevConsoleArchiveValidator.run("/usr/bin/codesign", ["--force", "--deep", "--sign", "-", app.path])

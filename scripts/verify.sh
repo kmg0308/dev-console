@@ -103,6 +103,9 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist" | grep -Fxq 'DevConsole'
 /usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$APP/Contents/Info.plist" | grep -Fxq 'DevConsole'
 /usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$APP/Contents/Info.plist" | grep -Fxq 'APPL'
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$APP/Contents/Info.plist" | grep -Fxq 'DevConsole.icns'
+test -f "$APP/Contents/Resources/DevConsole.icns"
+test ! -L "$APP/Contents/Resources/DevConsole.icns"
 if /usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist" >/dev/null 2>&1; then
   echo "DevConsole must be a normal windowed app" >&2
   exit 1
@@ -130,6 +133,9 @@ fi
 grep -Fq 'RuntimeAtlasFeatureView(' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'TokenMeterFeatureView(host: tokenHost)' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'isEnabled: selectedTab == .runtimeAtlas' Sources/DevConsoleApp/DevConsoleApp.swift
+grep -Fq 'DevConsoleTopBar(' Sources/DevConsoleApp/DevConsoleApp.swift
+grep -Fq 'await updates.runAutoChecks()' Sources/DevConsoleApp/DevConsoleApp.swift
+grep -Fq 'Label("Update \(version)"' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'com.kmg0308.devconsole' Sources/DevConsoleCore/DevConsoleCore.swift
 grep -Fq '</dev/null >/dev/null 2>&1 &' Sources/DevConsoleCore/DevConsoleCore.swift
 grep -Fq 'NSApplication.shared.terminate(nil)' Sources/DevConsoleApp/UpdateService.swift

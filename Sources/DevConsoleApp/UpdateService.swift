@@ -5,11 +5,22 @@ import DevConsoleCore
 
 @MainActor
 final class UpdateModel: ObservableObject {
+    private static let autoCheckIntervalNanoseconds: UInt64 = 21_600_000_000_000
+
     @Published private(set) var release: DevConsoleRelease?
     @Published private(set) var errorMessage: String?
     @Published private(set) var status = ""
     @Published private(set) var isChecking = false
     @Published private(set) var isInstalling = false
+
+    func runAutoChecks() async {
+        await check()
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: Self.autoCheckIntervalNanoseconds)
+            guard !Task.isCancelled else { return }
+            await check()
+        }
+    }
 
     func check() async {
         guard !isChecking else { return }

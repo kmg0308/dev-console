@@ -12,6 +12,6 @@ Runtime Atlas와 TokenMeter를 한 macOS 앱의 탭으로 제공하는 통합 sh
 
 `./scripts/verify.sh`는 앱, helper, ZIP, PKG, updater와 workflow 계약을 검증합니다. `VERSION=0.1.0 ./scripts/package.sh`는 `dist`에 `DevConsole.app`, 고정·버전 ZIP/PKG와 manifest를 만듭니다.
 
-업데이트는 `kmg0308/dev-console`의 `DevConsole.zip`만 허용합니다. embedded feature는 이 서비스를 사용하지 않습니다.
+업데이트는 시작 시와 6시간마다 확인하며, 새 버전이 있으면 상단에 설치 버튼을 표시합니다. `kmg0308/dev-console`의 `DevConsole.zip`만 허용하고 embedded feature는 이 서비스를 사용하지 않습니다.
 
 컴포넌트 릴리스는 검증된 dependency-update PR을 만들고, DevConsole `main`은 전체 검증 후 앱을 릴리스합니다. 필요한 저장소 설정과 최소 권한은 `docs/github-setup.md`에 있습니다.
