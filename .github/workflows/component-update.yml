@@ -56,14 +56,34 @@ jobs:
             PR_NUMBER="$(gh pr view "$BRANCH" --json number --jq .number)"
           fi
           gh pr merge "$PR_NUMBER" --auto --squash
-          for _ in {1..60}; do
-            [[ "$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0 ]] && break
-            sleep 2
-          done
-          test "$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0
-          gh pr checks "$PR_NUMBER" --watch --required
-          for _ in {1..300}; do
-            [[ "$(gh pr view "$PR_NUMBER" --json state --jq .state)" == MERGED ]] && break
-            sleep 2
+
+          wait_for_required_checks() {
+            for _ in {1..60}; do
+              [[ "$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0 ]] && break
+              sleep 2
+            done
+            test "$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0
+            gh pr checks "$PR_NUMBER" --watch --required
+          }
+
+          for _ in {1..10}; do
+            wait_for_required_checks
+            for _ in {1..30}; do
+              STATE="$(gh pr view "$PR_NUMBER" --json state --jq .state)"
+              [[ "$STATE" == MERGED ]] && exit 0
+              MERGE_STATE="$(gh pr view "$PR_NUMBER" --json mergeStateStatus --jq .mergeStateStatus)"
+              [[ "$MERGE_STATE" == BEHIND ]] && break
+              sleep 2
+            done
+            [[ "$MERGE_STATE" == BEHIND ]] || continue
+            PREVIOUS_HEAD="$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)"
+            gh pr update-branch "$PR_NUMBER" --rebase
+            for _ in {1..60}; do
+              STATE="$(gh pr view "$PR_NUMBER" --json state --jq .state)"
+              [[ "$STATE" == MERGED ]] && exit 0
+              [[ "$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)" != "$PREVIOUS_HEAD" ]] && break
+              sleep 1
+            done
+            test "$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)" != "$PREVIOUS_HEAD"
           done
           test "$(gh pr view "$PR_NUMBER" --json state --jq .state)" = MERGED
