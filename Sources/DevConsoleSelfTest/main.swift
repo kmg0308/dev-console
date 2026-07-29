@@ -9,8 +9,10 @@ let asset = DevConsoleRelease.Asset(name: "DevConsole.zip", browserDownloadURL: 
 let release = DevConsoleRelease(tagName: "v1.2.0", draft: false, prerelease: false, assets: [asset])
 require(DevConsoleReleasePolicy.isAcceptable(release, currentVersion: "1.1.9"), "new release is accepted")
 require(!DevConsoleReleasePolicy.isAcceptable(release, currentVersion: "1.2.0"), "same release is rejected")
-require(!DevConsoleReleasePolicy.isTrusted(URL(string: "http://github.com/kmg0308/dev-console/releases/download/v1.2.0/DevConsole.zip")!), "update URL requires HTTPS")
-require(!DevConsoleReleasePolicy.isTrusted(URL(string: "https://github.com/other/dev-console/releases/download/v1.2.0/DevConsole.zip")!), "update URL requires the DevConsole repository")
+require(!DevConsoleReleasePolicy.isTrusted(URL(string: "http://github.com/kmg0308/dev-console/releases/download/v1.2.0/DevConsole.zip")!, tag: "v1.2.0"), "update URL requires HTTPS")
+require(!DevConsoleReleasePolicy.isTrusted(URL(string: "https://github.com/other/dev-console/releases/download/v1.2.0/DevConsole.zip")!, tag: "v1.2.0"), "update URL requires the DevConsole repository")
+require(!DevConsoleReleasePolicy.isTrusted(URL(string: "https://objects.githubusercontent.com/DevConsole.zip")!, tag: "v1.2.0"), "update metadata cannot inject a redirect host")
+require(!DevConsoleReleasePolicy.isTrusted(URL(string: "https://github.com/kmg0308/dev-console/releases/download/v1.1.9/DevConsole.zip")!, tag: "v1.2.0"), "update URL tag must match release metadata")
 require(Version("1.10") > Version("1.9.9"), "version comparison")
 
 let fixture = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

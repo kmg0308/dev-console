@@ -20,7 +20,12 @@ public struct DevConsoleRelease: Decodable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey { case tagName = "tag_name", draft, prerelease, assets }
 
     public var version: String? { tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName }
-    public var zip: Asset? { assets.first { $0.name == DevConsoleReleasePolicy.archiveName && DevConsoleReleasePolicy.isTrusted($0.browserDownloadURL) } }
+    public var zip: Asset? {
+        assets.first {
+            $0.name == DevConsoleReleasePolicy.archiveName
+                && DevConsoleReleasePolicy.isTrusted($0.browserDownloadURL, tag: tagName)
+        }
+    }
 }
 
 public enum DevConsoleReleasePolicy {
@@ -37,10 +42,15 @@ public enum DevConsoleReleasePolicy {
         return Version(version) > Version(currentVersion)
     }
 
-    public static func isTrusted(_ url: URL) -> Bool {
-        guard url.scheme == "https", let host = url.host else { return false }
-        if host == "github.com" { return url.path.hasPrefix("/kmg0308/dev-console/releases/download/") && url.path.hasSuffix("/DevConsole.zip") }
-        return host == "objects.githubusercontent.com" || host.hasSuffix(".objects.githubusercontent.com")
+    public static func isTrusted(_ url: URL, tag: String) -> Bool {
+        guard url.scheme == "https",
+              url.host == "github.com",
+              url.port == nil,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil else { return false }
+        return url.path == "/\(owner)/\(repository)/releases/download/\(tag)/\(archiveName)"
     }
 }
 

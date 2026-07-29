@@ -255,7 +255,7 @@ struct DevConsoleApp: App {
     @State private var selectedTab: DevConsoleTab = .runtimeAtlas
 
     var body: some Scene {
-        WindowGroup("DevConsole", id: "main") {
+        Window("DevConsole", id: "main") {
             DevConsoleRootView(
                 runtimeHost: runtimeHost,
                 tokenHost: tokenHost,
