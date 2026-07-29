@@ -246,6 +246,7 @@ private struct DevConsoleRootView: View {
         }
         .background(Color(red: 0.035, green: 0.039, blue: 0.047))
         .background(DevConsoleWindowConfigurator())
+        .ignoresSafeArea(.container, edges: .top)
         .preferredColorScheme(.dark)
         .frame(
             minWidth: RuntimeAtlasTheme.minimumWindowWidth,
