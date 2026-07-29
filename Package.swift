@@ -20,7 +20,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/kmg0308/runtime_atlas.git",
-            revision: "69ba9c07e6f5f220aaeaff836ca6199a139abdff"
+            revision: "59702ca141f43d123e22e14c27b0df2bca33d2f0"
         ),
         .package(
             url: "https://github.com/kmg0308/token-scope.git",
