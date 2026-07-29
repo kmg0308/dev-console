@@ -56,6 +56,11 @@ jobs:
             PR_NUMBER="$(gh pr view "$BRANCH" --json number --jq .number)"
           fi
           gh pr merge "$PR_NUMBER" --auto --squash
+          for _ in {1..60}; do
+            [[ "$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0 ]] && break
+            sleep 2
+          done
+          test "$(gh pr view "$PR_NUMBER" --json statusCheckRollup --jq '.statusCheckRollup | length')" -gt 0
           gh pr checks "$PR_NUMBER" --watch --required
           for _ in {1..300}; do
             [[ "$(gh pr view "$PR_NUMBER" --json state --jq .state)" == MERGED ]] && break
