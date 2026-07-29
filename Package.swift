@@ -24,7 +24,7 @@ let package = Package(
         ),
         .package(
             url: "https://github.com/kmg0308/token-scope.git",
-            revision: "4980c27572462d01be7f36616cf43d365f539479"
+            revision: "a4059242384e3ce429406dfa1bb5e16c06667c7b"
         )
     ],
     targets: [

@@ -1,5 +1,5 @@
 {
-  "originHash" : "78b4f994802723b070a0255565c24a513e2808416b91623e07b3c254cc2fd3d1",
+  "originHash" : "b4a7c4a0e2bd87e75ac61379e8800ad3ecbcbdc26a8a4ef75c82b7dbe66b3535",
   "pins" : [
     {
       "identity" : "runtime_atlas",
@@ -14,7 +14,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/kmg0308/token-scope.git",
       "state" : {
-        "revision" : "4980c27572462d01be7f36616cf43d365f539479"
+        "revision" : "a4059242384e3ce429406dfa1bb5e16c06667c7b"
       }
     }
   ],
