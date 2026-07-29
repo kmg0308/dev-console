@@ -134,6 +134,7 @@ grep -Fq 'RuntimeAtlasFeatureView(' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'TokenMeterFeatureView(host: tokenHost)' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'isEnabled: selectedTab == .runtimeAtlas' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'DevConsoleTopBar(' Sources/DevConsoleApp/DevConsoleApp.swift
+grep -Fq '.ignoresSafeArea(.container, edges: .top)' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'await updates.runAutoChecks()' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'Label("Update \(version)"' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'com.kmg0308.devconsole' Sources/DevConsoleCore/DevConsoleCore.swift
