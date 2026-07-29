@@ -1,0 +1,22 @@
+{
+  "originHash" : "608ae0be9e622b9c717d1c339c0aec62b3103e7c047248b5af64ebc0659643db",
+  "pins" : [
+    {
+      "identity" : "runtime_atlas",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kmg0308/runtime_atlas.git",
+      "state" : {
+        "revision" : "69ba9c07e6f5f220aaeaff836ca6199a139abdff"
+      }
+    },
+    {
+      "identity" : "token-scope",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/kmg0308/token-scope.git",
+      "state" : {
+        "revision" : "4980c27572462d01be7f36616cf43d365f539479"
+      }
+    }
+  ],
+  "version" : 3
+}
