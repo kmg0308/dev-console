@@ -153,5 +153,6 @@ grep -Fq 'branches: [main]' .github/workflows/release.yml
 grep -Fq 'test "$(git rev-parse origin/main)" = "$GITHUB_SHA"' .github/workflows/release.yml
 grep -Fq 'dist/DevConsole.zip' .github/workflows/release.yml
 grep -Fq 'dist/DevConsole.pkg' .github/workflows/release.yml
+grep -Fq 'https://github.com/kmg0308/dev-console/releases/latest/download/DevConsole.pkg' README.md
 
 echo "verify passed"
