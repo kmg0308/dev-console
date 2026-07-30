@@ -45,11 +45,9 @@ try! FileManager.default.createDirectory(at: successRoot, withIntermediateDirect
 try! FileManager.default.copyItem(at: app, to: successStaged)
 let successScript = successRoot.appendingPathComponent("install.sh")
 try! DevConsoleInstallerScript.make(
-    appPID: Int32.max,
     staged: successStaged,
     target: successTarget,
-    backup: successBackup,
-    relaunch: false
+    backup: successBackup
 ).write(to: successScript, atomically: true, encoding: .utf8)
 try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: successScript.path)
 let successInstall = try! DevConsoleArchiveValidator.run("/bin/zsh", [successScript.path])
@@ -71,17 +69,79 @@ try! Data("tampered".utf8).write(
 )
 let rollbackScript = rollbackRoot.appendingPathComponent("install.sh")
 try! DevConsoleInstallerScript.make(
-    appPID: Int32.max,
     staged: rollbackStaged,
     target: rollbackTarget,
-    backup: rollbackBackup,
-    relaunch: false
+    backup: rollbackBackup
 ).write(to: rollbackScript, atomically: true, encoding: .utf8)
 try! FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: rollbackScript.path)
 let rollbackInstall = try! DevConsoleArchiveValidator.run("/bin/zsh", [rollbackScript.path])
 require(rollbackInstall.status == 6, "installer reports candidate verification failure")
 require(FileManager.default.fileExists(atPath: rollbackTarget.appendingPathComponent("marker").path), "installer restores previous app")
 require(!FileManager.default.fileExists(atPath: rollbackBackup.path), "rollback consumes backup")
+
+let launcherRoot = fixture.appendingPathComponent("launcher-staging")
+let launcherTarget = fixture.appendingPathComponent("launcher/DevConsole.app")
+let launcherStaged = launcherRoot.appendingPathComponent("DevConsole.next.app")
+let launcherInstaller = launcherRoot.appendingPathComponent("install.sh")
+let launcherScript = launcherRoot.appendingPathComponent("launch.sh")
+let launcherError = fixture.appendingPathComponent("launcher-error.txt")
+try! FileManager.default.createDirectory(at: launcherRoot, withIntermediateDirectories: true)
+try! FileManager.default.createDirectory(at: launcherTarget.deletingLastPathComponent(), withIntermediateDirectories: true)
+try! FileManager.default.copyItem(at: app, to: launcherStaged)
+try! DevConsoleInstallerScript.make(
+    staged: launcherStaged,
+    target: launcherTarget,
+    backup: fixture.appendingPathComponent("launcher/DevConsole.previous.app")
+).write(to: launcherInstaller, atomically: true, encoding: .utf8)
+let watchedProcess = Process()
+watchedProcess.executableURL = URL(fileURLWithPath: "/bin/sleep")
+watchedProcess.arguments = ["0.2"]
+try! watchedProcess.run()
+try! DevConsoleInstallerScript.makeLauncher(
+    appPID: watchedProcess.processIdentifier,
+    installer: launcherInstaller,
+    target: launcherTarget,
+    root: launcherRoot,
+    errorReport: launcherError,
+    requiresAdministrator: false,
+    relaunch: false
+).write(to: launcherScript, atomically: true, encoding: .utf8)
+let launcherInstall = try! DevConsoleArchiveValidator.run("/bin/zsh", [launcherScript.path])
+require(launcherInstall.status == 0, "launcher observes installer success")
+require(FileManager.default.fileExists(atPath: launcherTarget.appendingPathComponent("Contents/Info.plist").path), "launcher installs candidate")
+require(!FileManager.default.fileExists(atPath: launcherRoot.path), "launcher cleans staging after installation")
+require(!FileManager.default.fileExists(atPath: launcherError.path), "successful launcher clears prior error")
+
+let failedLauncherRoot = fixture.appendingPathComponent("failed-launcher-staging")
+let failedLauncherInstaller = failedLauncherRoot.appendingPathComponent("install.sh")
+let failedLauncherScript = failedLauncherRoot.appendingPathComponent("launch.sh")
+try! FileManager.default.createDirectory(at: failedLauncherRoot, withIntermediateDirectories: true)
+try! "#!/bin/zsh\nexit 9\n".write(to: failedLauncherInstaller, atomically: true, encoding: .utf8)
+let administratorLauncher = DevConsoleInstallerScript.makeLauncher(
+    appPID: Int32.max,
+    installer: failedLauncherInstaller,
+    target: launcherTarget,
+    root: failedLauncherRoot,
+    errorReport: launcherError,
+    requiresAdministrator: true,
+    relaunch: false
+)
+require(administratorLauncher.contains("with administrator privileges"), "launcher elevates only the installer")
+try! administratorLauncher.write(to: failedLauncherScript, atomically: true, encoding: .utf8)
+require((try! DevConsoleArchiveValidator.run("/bin/zsh", ["-n", failedLauncherScript.path])).status == 0, "administrator launcher is valid shell")
+try! DevConsoleInstallerScript.makeLauncher(
+    appPID: Int32.max,
+    installer: failedLauncherInstaller,
+    target: launcherTarget,
+    root: failedLauncherRoot,
+    errorReport: launcherError,
+    requiresAdministrator: false,
+    relaunch: false
+).write(to: failedLauncherScript, atomically: true, encoding: .utf8)
+let failedLauncherInstall = try! DevConsoleArchiveValidator.run("/bin/zsh", [failedLauncherScript.path])
+require(failedLauncherInstall.status == 9, "launcher reports installer failure")
+require((try! String(contentsOf: launcherError)).contains("9"), "launcher records installer failure")
+require(!FileManager.default.fileExists(atPath: failedLauncherRoot.path), "failed launcher cleans staging")
 
 let lockedParent = fixture.appendingPathComponent("locked")
 try! FileManager.default.createDirectory(at: lockedParent, withIntermediateDirectories: true)

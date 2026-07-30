@@ -5,12 +5,17 @@ import DevConsoleCore
 @MainActor
 final class UpdateModel: ObservableObject {
     private static let autoCheckIntervalNanoseconds: UInt64 = 21_600_000_000_000
+    private var previousInstallError = DevConsoleUpdateService.previousInstallError()
 
     @Published private(set) var release: DevConsoleRelease?
     @Published private(set) var errorMessage: String?
     @Published private(set) var status = ""
     @Published private(set) var isChecking = false
     @Published private(set) var isInstalling = false
+
+    init() {
+        errorMessage = previousInstallError
+    }
 
     func runAutoChecks() async {
         await check()
@@ -23,13 +28,17 @@ final class UpdateModel: ObservableObject {
 
     func check() async {
         guard !isChecking else { return }
-        errorMessage = nil
         isChecking = true; defer { isChecking = false }
-        do { release = try await DevConsoleUpdateService.latestAcceptableRelease(currentVersion: DevConsoleUpdateService.installedVersion()); status = release == nil ? "최신 버전입니다." : "업데이트를 설치할 수 있습니다." }
+        do {
+            release = try await DevConsoleUpdateService.latestAcceptableRelease(currentVersion: DevConsoleUpdateService.installedVersion())
+            errorMessage = previousInstallError
+            status = release == nil ? "최신 버전입니다." : "업데이트를 설치할 수 있습니다."
+        }
         catch { errorMessage = error.localizedDescription }
     }
     func installAvailable() async -> Bool {
         guard let release, !isInstalling else { return false }
+        previousInstallError = nil
         errorMessage = nil
         isInstalling = true; status = "업데이트를 준비 중입니다."; defer { isInstalling = false }
         do {
@@ -43,6 +52,9 @@ final class UpdateModel: ObservableObject {
 }
 
 enum DevConsoleUpdateService {
+    private static let errorReport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("DevConsole/update-error.txt")
+
     static func latestRelease() async throws -> DevConsoleRelease {
         let url = URL(string: "https://api.github.com/repos/\(DevConsoleReleasePolicy.owner)/\(DevConsoleReleasePolicy.repository)/releases/latest")!
         let (data, response) = try await URLSession.shared.data(from: url)
@@ -54,8 +66,11 @@ enum DevConsoleUpdateService {
         return DevConsoleReleasePolicy.isAcceptable(release, currentVersion: currentVersion) ? release : nil
     }
     static func installedVersion() -> String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0" }
+    static func previousInstallError() -> String? {
+        try? String(contentsOf: errorReport, encoding: .utf8)
+    }
 
-    /// Returns true only after a detached installer is ready; the caller must then terminate via AppKit.
+    /// Returns true only after a detached launcher is ready; the caller must then terminate via AppKit.
     static func install(_ release: DevConsoleRelease) async throws -> Bool {
         guard Bundle.main.bundleIdentifier == DevConsoleReleasePolicy.bundleIdentifier,
               Bundle.main.bundleURL.lastPathComponent == DevConsoleReleasePolicy.appName,
@@ -82,27 +97,28 @@ enum DevConsoleUpdateService {
     }
 
     private static func scheduleSwap(appPID: Int32, staged: URL, target: URL, backup: URL) throws {
-        let script = staged.deletingLastPathComponent().appendingPathComponent("install.sh")
-        let body = DevConsoleInstallerScript.make(
-            appPID: appPID,
+        let root = staged.deletingLastPathComponent()
+        let installer = root.appendingPathComponent("install.sh")
+        let launcher = root.appendingPathComponent("launch.sh")
+        try FileManager.default.createDirectory(at: errorReport.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try DevConsoleInstallerScript.make(
             staged: staged,
             target: target,
             backup: backup
-        )
-        try body.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
-        let command = DevConsoleInstallerScript.detachedCommand(script: script)
+        ).write(to: installer, atomically: true, encoding: .utf8)
+        try DevConsoleInstallerScript.makeLauncher(
+            appPID: appPID,
+            installer: installer,
+            target: target,
+            root: root,
+            errorReport: errorReport,
+            requiresAdministrator: DevConsoleInstallerScript.requiresAdministrator(target: target)
+        ).write(to: launcher, atomically: true, encoding: .utf8)
+        let command = DevConsoleInstallerScript.detachedCommand(script: launcher)
         let process = Process()
-        if !DevConsoleInstallerScript.requiresAdministrator(target: target) {
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-c", command]
-        } else {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            process.arguments = ["-e", "do shell script " + appleScriptQuote(command) + " with administrator privileges"]
-        }
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-c", command]
         try process.run(); process.waitUntilExit()
         guard process.terminationStatus == 0 else { throw DevConsoleArchiveError.invalid("업데이트 설치 도우미를 시작하지 못했습니다.") }
     }
-
-    private static func appleScriptQuote(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
 }
