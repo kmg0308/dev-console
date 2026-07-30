@@ -140,10 +140,10 @@ grep -Fq 'Label("Update \(version)"' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'com.kmg0308.devconsole' Sources/DevConsoleCore/DevConsoleCore.swift
 grep -Fq '</dev/null >/dev/null 2>&1 &' Sources/DevConsoleCore/DevConsoleCore.swift
 ! grep -Fq 'NSApplication.shared.terminate(nil)' Sources/DevConsoleApp/UpdateService.swift
-grep -Fq 'terminateAfterDismissal = true' Sources/DevConsoleApp/DevConsoleApp.swift
+grep -Fq 'DispatchQueue.main.async' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'NSApplication.shared.terminate(nil)' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'DevConsoleInstallerScript.requiresAdministrator' Sources/DevConsoleApp/UpdateService.swift
-grep -Fq 'with administrator privileges' Sources/DevConsoleApp/UpdateService.swift
+grep -Fq 'with administrator privileges' Sources/DevConsoleCore/DevConsoleCore.swift
 test ! -d Sources/RuntimeAtlasFeature
 test ! -d Sources/TokenMeterFeature
 

@@ -287,7 +287,6 @@ private struct DevConsoleRootView: View {
 private struct DevConsoleUpdateView: View {
     @ObservedObject var model: UpdateModel
     @Environment(\.dismiss) private var dismiss
-    @State private var terminateAfterDismissal = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -315,8 +314,10 @@ private struct DevConsoleUpdateView: View {
                     Button("Install and Relaunch") {
                         Task {
                             if await model.installAvailable() {
-                                terminateAfterDismissal = true
                                 dismiss()
+                                DispatchQueue.main.async {
+                                    NSApplication.shared.terminate(nil)
+                                }
                             }
                         }
                     }
@@ -328,11 +329,6 @@ private struct DevConsoleUpdateView: View {
         .padding(24)
         .frame(width: 420)
         .interactiveDismissDisabled(model.isInstalling)
-        .onDisappear {
-            if terminateAfterDismissal {
-                NSApplication.shared.terminate(nil)
-            }
-        }
     }
 }
 

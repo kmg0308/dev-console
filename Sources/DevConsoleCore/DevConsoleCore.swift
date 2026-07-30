@@ -165,30 +165,61 @@ public enum DevConsoleArchiveValidator {
 
 public enum DevConsoleInstallerScript {
     public static func make(
-        appPID: Int32,
         staged: URL,
         target: URL,
-        backup: URL,
-        relaunch: Bool = true
+        backup: URL
     ) -> String {
-        let root = staged.deletingLastPathComponent()
-        let relaunchCommand = relaunch
-            ? "\n/usr/bin/open -n \(shellQuote(target.path))"
-            : ""
-        return """
+        """
         #!/bin/zsh
         set -eu
-        trap 'rm -rf \(shellQuote(root.path))' EXIT
-        for i in {1..100}; do kill -0 \(appPID) 2>/dev/null || break; sleep 0.1; done
-        kill -0 \(appPID) 2>/dev/null && exit 4
         rm -rf \(shellQuote(backup.path))
         if [ -e \(shellQuote(target.path)) ] && ! mv \(shellQuote(target.path)) \(shellQuote(backup.path)); then exit 5; fi
         if ! mv \(shellQuote(staged.path)) \(shellQuote(target.path)) || ! /usr/bin/codesign --verify --deep --strict \(shellQuote(target.path)); then
           rm -rf \(shellQuote(target.path))
           if [ -e \(shellQuote(backup.path)) ]; then mv \(shellQuote(backup.path)) \(shellQuote(target.path)) || exit 7; fi
           exit 6
-        fi\(relaunchCommand)
+        fi
         rm -rf \(shellQuote(backup.path)) || true
+        """
+    }
+
+    public static func makeLauncher(
+        appPID: Int32,
+        installer: URL,
+        target: URL,
+        root: URL,
+        errorReport: URL,
+        requiresAdministrator: Bool,
+        relaunch: Bool = true
+    ) -> String {
+        let install = "/bin/zsh \(shellQuote(installer.path))"
+        let installCommand = requiresAdministrator
+            ? "/usr/bin/osascript -e \(shellQuote("do shell script \(appleScriptQuote(install)) with administrator privileges"))"
+            : install
+        let relaunchCommand = relaunch
+            ? "/usr/bin/open -n \(shellQuote(target.path)) >/dev/null 2>&1 || true"
+            : ":"
+        return """
+        #!/bin/zsh
+        set -u
+        finish() {
+          \(relaunchCommand)
+          rm -rf \(shellQuote(root.path))
+        }
+        trap finish EXIT
+        for i in {1..100}; do kill -0 \(appPID) 2>/dev/null || break; sleep 0.1; done
+        if kill -0 \(appPID) 2>/dev/null; then
+          result=4
+        else
+          \(installCommand)
+          result=$?
+        fi
+        if [ "$result" -eq 0 ]; then
+          rm -f \(shellQuote(errorReport.path))
+        else
+          /usr/bin/printf '업데이트 설치에 실패했습니다. (종료 코드 %d)\\n' "$result" > \(shellQuote(errorReport.path))
+        fi
+        exit "$result"
         """
     }
 
@@ -205,6 +236,10 @@ public enum DevConsoleInstallerScript {
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\u{22}'\u{22}'") + "'"
+    }
+
+    private static func appleScriptQuote(_ value: String) -> String {
+        "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
 }
 
