@@ -139,7 +139,9 @@ grep -Fq 'await updates.runAutoChecks()' Sources/DevConsoleApp/DevConsoleApp.swi
 grep -Fq 'Label("Update \(version)"' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'com.kmg0308.devconsole' Sources/DevConsoleCore/DevConsoleCore.swift
 grep -Fq '</dev/null >/dev/null 2>&1 &' Sources/DevConsoleCore/DevConsoleCore.swift
-grep -Fq 'NSApplication.shared.terminate(nil)' Sources/DevConsoleApp/UpdateService.swift
+! grep -Fq 'NSApplication.shared.terminate(nil)' Sources/DevConsoleApp/UpdateService.swift
+grep -Fq 'terminateAfterDismissal = true' Sources/DevConsoleApp/DevConsoleApp.swift
+grep -Fq 'NSApplication.shared.terminate(nil)' Sources/DevConsoleApp/DevConsoleApp.swift
 grep -Fq 'DevConsoleInstallerScript.requiresAdministrator' Sources/DevConsoleApp/UpdateService.swift
 grep -Fq 'with administrator privileges' Sources/DevConsoleApp/UpdateService.swift
 test ! -d Sources/RuntimeAtlasFeature

@@ -1,6 +1,5 @@
 import Foundation
 import SwiftUI
-import AppKit
 import DevConsoleCore
 
 @MainActor
@@ -29,16 +28,17 @@ final class UpdateModel: ObservableObject {
         do { release = try await DevConsoleUpdateService.latestAcceptableRelease(currentVersion: DevConsoleUpdateService.installedVersion()); status = release == nil ? "최신 버전입니다." : "업데이트를 설치할 수 있습니다." }
         catch { errorMessage = error.localizedDescription }
     }
-    func installAvailable() async {
-        guard let release, !isInstalling else { return }
+    func installAvailable() async -> Bool {
+        guard let release, !isInstalling else { return false }
         errorMessage = nil
         isInstalling = true; status = "업데이트를 준비 중입니다."; defer { isInstalling = false }
         do {
             if try await DevConsoleUpdateService.install(release) {
                 status = "업데이트를 설치하기 위해 앱을 종료합니다."
-                NSApplication.shared.terminate(nil)
+                return true
             }
         } catch { errorMessage = error.localizedDescription }
+        return false
     }
 }
 
