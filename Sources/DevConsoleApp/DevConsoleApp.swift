@@ -287,6 +287,7 @@ private struct DevConsoleRootView: View {
 private struct DevConsoleUpdateView: View {
     @ObservedObject var model: UpdateModel
     @Environment(\.dismiss) private var dismiss
+    @State private var terminateAfterDismissal = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -304,6 +305,7 @@ private struct DevConsoleUpdateView: View {
                 Button("Close") {
                     dismiss()
                 }
+                .disabled(model.isInstalling)
                 Spacer()
                 Button("Check Again") {
                     Task { await model.check() }
@@ -311,7 +313,12 @@ private struct DevConsoleUpdateView: View {
                 .disabled(model.isChecking || model.isInstalling)
                 if model.release != nil {
                     Button("Install and Relaunch") {
-                        Task { await model.installAvailable() }
+                        Task {
+                            if await model.installAvailable() {
+                                terminateAfterDismissal = true
+                                dismiss()
+                            }
+                        }
                     }
                     .keyboardShortcut(.defaultAction)
                     .disabled(model.isChecking || model.isInstalling)
@@ -320,6 +327,12 @@ private struct DevConsoleUpdateView: View {
         }
         .padding(24)
         .frame(width: 420)
+        .interactiveDismissDisabled(model.isInstalling)
+        .onDisappear {
+            if terminateAfterDismissal {
+                NSApplication.shared.terminate(nil)
+            }
+        }
     }
 }
 
