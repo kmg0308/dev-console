@@ -1,12 +1,12 @@
 {
-  "originHash" : "0ed5a4937e1a3c86cfd3a4d9f314b95291a808523ecacea81960b161a4de506b",
+  "originHash" : "c4566da5d72dbebf0e3600ca79f438af63babc27c85cac1ea1e1dd0a9ad4e23f",
   "pins" : [
     {
       "identity" : "runtime_atlas",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/kmg0308/runtime_atlas.git",
       "state" : {
-        "revision" : "92b17a461913febf3957d6bfe51a0b02452ecd7c"
+        "revision" : "caa9fae88153de439efa0fb29587e63ce4e87a6c"
       }
     },
     {
