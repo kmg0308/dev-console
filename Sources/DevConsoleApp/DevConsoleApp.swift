@@ -121,7 +121,7 @@ private struct DevConsoleWindowConfigurator: NSViewRepresentable {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.titlebarSeparatorStyle = .none
-        window.isMovableByWindowBackground = true
+        window.isMovableByWindowBackground = false
         window.backgroundColor = NSColor(
             calibratedRed: 0.035,
             green: 0.039,
@@ -129,6 +129,18 @@ private struct DevConsoleWindowConfigurator: NSViewRepresentable {
             alpha: 1
         )
     }
+}
+
+private final class DevConsoleWindowDragView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+}
+
+private struct DevConsoleWindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        DevConsoleWindowDragView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 @MainActor
@@ -139,6 +151,9 @@ private struct DevConsoleTopBar: View {
 
     var body: some View {
         ZStack {
+            DevConsoleWindowDragHandle()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
             HStack(spacing: 3) {
                 tabButton(.runtimeAtlas)
                 tabButton(.tokenMeter)
