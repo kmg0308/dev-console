@@ -923,9 +923,10 @@ function selfTest() {
   ]);
   assert.equal(repair.appSign[1].at(-1), runtimeMacPlan.app);
   assert.equal(repair.appArchive[1].at(-2), runtimeMacPlan.app);
-  assert.equal(repair.appArchive[1].at(-1), "/private/release/RuntimeAtlas.app.zip");
+  const repairArchive = join("/private/release", "RuntimeAtlas.app.zip");
+  assert.equal(repair.appArchive[1].at(-1), repairArchive);
   assert.deepEqual(repair.appNotarize[1].slice(0, 3), [
-    "notarytool", "submit", "/private/release/RuntimeAtlas.app.zip",
+    "notarytool", "submit", repairArchive,
   ]);
   assert(!repair.appNotarize[1].includes("--password"));
   assert(!repair.appNotarize[1].includes("--apple-id"));
