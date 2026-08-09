@@ -12,6 +12,11 @@ uuid.workspace = true
 name = "runtime-atlas-supervisor"
 path = "src/main.rs"
 
+[[test]]
+name = "windows_batch_argv"
+path = "tests/windows_batch_argv.rs"
+harness = false
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

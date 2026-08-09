@@ -111,57 +111,6 @@ fn preserves_windows_cwd_arguments_streams_and_exit_code() {
 }
 
 #[test]
-fn preserves_tokenized_arguments_through_an_npm_style_cmd_shim() {
-    let directory = tempfile::tempdir().unwrap();
-    let fixture_directory = directory.path().join("fixture (space)");
-    fs::create_dir(&fixture_directory).unwrap();
-    let capture = fixture_directory.join("capture.ps1");
-    fs::write(
-        &capture,
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n[Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject $args))\n",
-    )
-    .unwrap();
-    fs::write(
-        fixture_directory.join("npm-like.cmd"),
-        "@ECHO off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0capture.ps1\" %*\r\nEXIT /b %ERRORLEVEL%\r\n",
-    )
-    .unwrap();
-    let side_effect = directory.path().join("owned");
-    let arguments = vec![
-        "".to_owned(),
-        "two words".to_owned(),
-        "한글".to_owned(),
-        "(parentheses)".to_owned(),
-        "space trailing\\".to_owned(),
-        "%PATH%".to_owned(),
-        "!UNEXPANDED!".to_owned(),
-        "^".to_owned(),
-        "&".to_owned(),
-        "|".to_owned(),
-        "<".to_owned(),
-        ">".to_owned(),
-        "quote\"inside".to_owned(),
-        "slashes\\\\\"quote".to_owned(),
-        "& echo injected>owned".to_owned(),
-    ];
-
-    let output = supervisor()
-        .env("PATH", path_with_first(&fixture_directory))
-        .env("PATHEXT", ".CMD;.EXE;.BAT")
-        .arg("--cwd")
-        .arg(directory.path())
-        .args(["--", "npm-like"])
-        .args(&arguments)
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
-    let actual: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(actual, arguments);
-    assert!(!side_effect.exists());
-}
-
-#[test]
 fn propagates_batch_exit_code() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = directory.path().join("exit.cmd");
