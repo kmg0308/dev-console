@@ -213,7 +213,7 @@ fn read_sessions(
     {
         return Err(HermesError::IncompatibleSchema);
     }
-    let message_columns = columns(connection, "messages").unwrap_or_default();
+    let message_columns = columns(connection, "messages")?;
     let message_time =
         if message_columns.contains("session_id") && message_columns.contains("timestamp") {
             "(SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id)"
