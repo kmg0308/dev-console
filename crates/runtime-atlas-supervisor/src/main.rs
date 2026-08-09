@@ -1,10 +1,4 @@
 use serde::Serialize;
-#[cfg(windows)]
-use std::{
-    ffi::OsStr,
-    mem::size_of,
-    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
-};
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -16,6 +10,11 @@ use std::{
 use std::{
     ffi::{CString, OsStr},
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd, io::FromRawFd},
+};
+#[cfg(windows)]
+use std::{
+    mem::size_of,
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
 };
 use uuid::Uuid;
 
@@ -201,6 +200,8 @@ impl Drop for ControlFileGuard {
 impl SessionMarkerGuard {
     fn create(spec: &SessionSpec, control_parent: &File) -> io::Result<Self> {
         let (parent, name) = open_private_parent(&spec.path, "session file")?;
+        #[cfg(windows)]
+        let _ = &name;
         if !same_file(&parent, control_parent)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -267,7 +268,7 @@ impl SessionMarkerGuard {
                         "session file parent was replaced before marker publication",
                     ));
                 }
-                rename_windows_at(&file, &parent, &name)?;
+                rename_windows_at(&file, &parent, &spec.path)?;
             }
             #[cfg(unix)]
             {
@@ -581,22 +582,19 @@ fn open_windows_probe(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn rename_windows_at(file: &File, _parent: &File, name: &OsStr) -> io::Result<()> {
+fn rename_windows_at(file: &File, _parent: &File, path: &Path) -> io::Result<()> {
     use windows_sys::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
     };
 
-    let mut components = Path::new(name).components();
-    if !matches!(components.next(), Some(std::path::Component::Normal(value)) if value == name)
-        || components.next().is_some()
-    {
+    if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session marker name must be one relative path component",
+            "session marker path must be absolute",
         ));
     }
-    let name = name.encode_wide().collect::<Vec<_>>();
+    let name = path.as_os_str().encode_wide().collect::<Vec<_>>();
     if name.is_empty() || name.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -627,7 +625,7 @@ fn rename_windows_at(file: &File, _parent: &File, name: &OsStr) -> io::Result<()
     unsafe {
         info.write(FILE_RENAME_INFO::default());
         (*info).Anonymous.ReplaceIfExists = false;
-        // A simple name with a null root stays in the opened file's current directory.
+        // Win32 resolves relative names against the process CWD, so use the exact final path.
         (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -1779,6 +1777,8 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::ffi::OsStr;
 
     #[cfg(windows)]
     #[test]
@@ -1795,13 +1795,13 @@ mod tests {
         fs::create_dir_all(&marker_directory).unwrap();
         let marker_path = marker_directory.join("session.json");
         let moved_marker = marker_directory.join("moved.json");
-        let (parent, marker_name) = open_private_parent(&marker_path, "session file").unwrap();
+        let (parent, _) = open_private_parent(&marker_path, "session file").unwrap();
         let temporary_name = OsStr::new("session.tmp");
         let temporary_path = marker_directory.join(temporary_name);
         let mut marker = open_windows_path(&temporary_path, true).unwrap();
         assert!(windows_parent_matches(&parent, &marker_directory).unwrap());
         marker.write_all(b"owned").unwrap();
-        rename_windows_at(&marker, &parent, &marker_name).unwrap();
+        rename_windows_at(&marker, &parent, &marker_path).unwrap();
         let published = open_windows_probe(&marker_path).unwrap();
         assert!(windows_parent_matches(&parent, &marker_directory).unwrap());
         assert!(same_file(&marker, &published).unwrap());
