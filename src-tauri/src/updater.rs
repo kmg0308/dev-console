@@ -774,7 +774,7 @@ fn windows_reader_product_metadata(
         .map_err(string_error)?;
     std::io::copy(reader, &mut artifact).map_err(string_error)?;
     artifact.flush().map_err(string_error)?;
-    windows_file_product_metadata(artifact.path())
+    windows_file_product_metadata(&artifact.into_temp_path())
 }
 
 #[cfg(windows)]
