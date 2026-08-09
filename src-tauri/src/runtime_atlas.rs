@@ -188,6 +188,173 @@ impl RuntimeAtlasState {
         Ok((loaded.value.schema_version, loaded.value.sessions))
     }
 
+    fn ensure_runs_inactive(
+        &self,
+        snapshot: &RuntimeAtlasSnapshot,
+        blocks: impl Fn(Uuid) -> bool,
+        error: &'static str,
+    ) -> Result<(), String> {
+        let (_, sessions) = self.action_sessions_for_mutation()?;
+        let stored_run = sessions.iter().any(|session| blocks(session.action_id));
+        let memory = self.lock()?;
+        let live_run = memory.active_runs.keys().any(|key| blocks(key.action_id))
+            || snapshot.action_runs.iter().any(|run| {
+                blocks(run.action_id)
+                    && matches!(
+                        run.phase,
+                        ActionRunPhase::Pending
+                            | ActionRunPhase::Running
+                            | ActionRunPhase::Restarting
+                            | ActionRunPhase::Stopping
+                    )
+            });
+        if stored_run || live_run {
+            return Err(error.to_owned());
+        }
+        Ok(())
+    }
+
+    fn action_guard_snapshot(&self) -> Result<RuntimeAtlasSnapshot, String> {
+        self.action_sessions_for_mutation()?;
+        let snapshot = self.compose_status(
+            observe_processes(),
+            DockerObservation {
+                availability: runtime_atlas_core::models::DiscoveryAvailability::available(),
+                containers: Vec::new(),
+                notices: Vec::new(),
+            },
+        )?;
+        self.require_reconciled_marker_inventory()?;
+        Ok(snapshot)
+    }
+
+    fn require_reconciled_marker_inventory(&self) -> Result<(), String> {
+        let loaded = self.sessions.load().map_err(string_error)?;
+        if loaded.recovery_notice.is_some() {
+            return Err("action session markers cannot be verified safely".to_owned());
+        }
+        let entries = fs::read_dir(&self.paths.action_session_markers_directory)
+            .map_err(|_| "action session markers cannot be verified safely".to_owned())?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|_| "action session markers cannot be verified safely".to_owned())?;
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+                continue;
+            };
+            if !matches!(extension, "json" | "control") {
+                if extension == "tmp"
+                    && path.file_name().is_some_and(|name| {
+                        name.to_string_lossy()
+                            .starts_with(".runtime-atlas-session-")
+                    })
+                {
+                    return Err("action session markers cannot be verified safely".to_owned());
+                }
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Uuid::parse_str(name).ok())
+                .ok_or_else(|| "action session markers cannot be verified safely".to_owned())?;
+            let record = loaded
+                .value
+                .sessions
+                .iter()
+                .find(|record| record.id == id)
+                .ok_or_else(|| "action session markers cannot be verified safely".to_owned())?;
+            if extension == "control" {
+                let valid = record.control_identity().is_some_and(|expected| {
+                    read_control_identity(&path)
+                        .is_ok_and(|(actual, state)| actual == expected && state == 0)
+                });
+                if !valid {
+                    return Err("action session markers cannot be verified safely".to_owned());
+                }
+                continue;
+            }
+            let (marker, _) = read_session_marker(&path)
+                .map_err(|_| "action session markers cannot be verified safely".to_owned())?;
+            if marker.schema_version != 2
+                || marker.session_id != id
+                || !marker.matches_session(record, path_flavor())
+                || !self.validate_session(
+                    record,
+                    &record.worktree_path,
+                    loaded.value.schema_version,
+                )
+            {
+                return Err("action session markers cannot be verified safely".to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_actions_inactive(
+        &self,
+        snapshot: &RuntimeAtlasSnapshot,
+        action_ids: &[Uuid],
+    ) -> Result<(), String> {
+        self.ensure_runs_inactive(
+            snapshot,
+            |action_id| action_ids.contains(&action_id),
+            "action cannot be changed while it has a pending, active, or unverified run",
+        )
+    }
+
+    fn save_action(&self, action: CustomActionDefinition) -> Result<(), String> {
+        let _operation = self
+            .action_operation
+            .lock()
+            .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
+        let snapshot = self.action_guard_snapshot()?;
+        self.ensure_actions_inactive(&snapshot, &[action.id])?;
+        self.store.save_custom_action(action).map_err(string_error)
+    }
+
+    fn delete_action(&self, action_id: Uuid) -> Result<(), String> {
+        let _operation = self
+            .action_operation
+            .lock()
+            .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
+        let snapshot = self.action_guard_snapshot()?;
+        self.ensure_actions_inactive(&snapshot, &[action_id])?;
+        self.store
+            .remove_custom_action(action_id)
+            .map_err(string_error)
+    }
+
+    fn remove_repository(&self, repository_id: Uuid) -> Result<(), String> {
+        let _operation = self
+            .action_operation
+            .lock()
+            .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
+        let snapshot = self.action_guard_snapshot()?;
+        let configuration = self.store.load().map_err(string_error)?.value;
+        let known_action_ids = configuration
+            .custom_actions
+            .iter()
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        let repository_action_ids = configuration
+            .custom_actions
+            .iter()
+            .filter(|action| action.repository_id == repository_id)
+            .map(|action| action.id)
+            .collect::<Vec<_>>();
+        self.ensure_runs_inactive(
+            &snapshot,
+            |action_id| {
+                repository_action_ids.contains(&action_id) || !known_action_ids.contains(&action_id)
+            },
+            "repository cannot be removed while it has a pending, active, or unverified run",
+        )?;
+        self.store
+            .remove_repository(repository_id)
+            .map_err(string_error)
+    }
+
     #[cfg(target_os = "macos")]
     fn login_environment(&self) -> Result<&[(OsString, OsString)], String> {
         self.login_environment
@@ -1151,11 +1318,27 @@ impl RuntimeAtlasState {
         self.shutdown_for_update_with(&supervisor_executable()?)
     }
 
+    pub fn shutdown_for_exit(&self) -> Result<(), String> {
+        let _operation = self
+            .action_operation
+            .lock()
+            .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
+        if self.update_shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.action_guard_snapshot()?;
+        self.shutdown_for_update_locked(&supervisor_executable()?)
+    }
+
     fn shutdown_for_update_with(&self, expected_executable: &Path) -> Result<(), String> {
         let _operation = self
             .action_operation
             .lock()
             .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
+        self.shutdown_for_update_locked(expected_executable)
+    }
+
+    fn shutdown_for_update_locked(&self, expected_executable: &Path) -> Result<(), String> {
         if self.update_shutdown.swap(true, Ordering::AcqRel) {
             return Err("Runtime Atlas update shutdown is already active".to_owned());
         }
@@ -1476,14 +1659,7 @@ pub fn runtime_atlas_remove_repository(
     state: State<'_, RuntimeAtlasState>,
     repository_id: String,
 ) -> Result<(), String> {
-    let _operation = state
-        .action_operation
-        .lock()
-        .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
-    state
-        .store
-        .remove_repository(Uuid::parse_str(&repository_id).map_err(string_error)?)
-        .map_err(string_error)
+    state.remove_repository(Uuid::parse_str(&repository_id).map_err(string_error)?)
 }
 
 #[tauri::command]
@@ -1499,11 +1675,7 @@ pub fn runtime_atlas_save_action(
     state: State<'_, RuntimeAtlasState>,
     action: CustomActionDefinition,
 ) -> Result<(), String> {
-    let _operation = state
-        .action_operation
-        .lock()
-        .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
-    state.store.save_custom_action(action).map_err(string_error)
+    state.save_action(action)
 }
 
 #[tauri::command]
@@ -1511,14 +1683,7 @@ pub fn runtime_atlas_delete_action(
     state: State<'_, RuntimeAtlasState>,
     action_id: String,
 ) -> Result<(), String> {
-    let _operation = state
-        .action_operation
-        .lock()
-        .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
-    state
-        .store
-        .remove_custom_action(Uuid::parse_str(&action_id).map_err(string_error)?)
-        .map_err(string_error)
+    state.delete_action(Uuid::parse_str(&action_id).map_err(string_error)?)
 }
 
 #[tauri::command]
@@ -2834,6 +2999,130 @@ mod tests {
     }
 
     #[test]
+    fn action_and_repository_mutations_fail_closed_for_runs_in_any_worktree() {
+        let (_directory, state, mut action, worktree) = action_confirmation_fixture();
+        let repository_id = action.repository_id;
+        let other_worktree = format!("{worktree}-other");
+        let pending =
+            ActionSessionRecord::pending(Uuid::new_v4(), action.id, &other_worktree).unwrap();
+        let session_id = pending.id;
+        state.sessions.upsert(pending).unwrap();
+
+        action.name = "Changed".into();
+        let expected = "action cannot be changed while it has a pending, active, or unverified run";
+        let repository_expected =
+            "repository cannot be removed while it has a pending, active, or unverified run";
+        assert_eq!(state.save_action(action.clone()).unwrap_err(), expected);
+        assert_eq!(state.delete_action(action.id).unwrap_err(), expected);
+        assert_eq!(
+            state.remove_repository(repository_id).unwrap_err(),
+            repository_expected
+        );
+        let stored = state.store.load().unwrap().value;
+        assert_eq!(stored.custom_actions[0].name, "Echo");
+        assert_eq!(stored.repositories[0].id, repository_id);
+
+        state.sessions.remove(session_id).unwrap();
+        let unknown = ActionSessionRecord::pending(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            format!("{worktree}-unknown"),
+        )
+        .unwrap();
+        let unknown_id = unknown.id;
+        state.sessions.upsert(unknown).unwrap();
+        assert_eq!(
+            state.remove_repository(repository_id).unwrap_err(),
+            repository_expected
+        );
+        state.sessions.remove(unknown_id).unwrap();
+
+        let key = action_key(action.id, &other_worktree);
+        state.lock().unwrap().action_runs.insert(
+            key.clone(),
+            ActionRun {
+                action_id: action.id,
+                worktree_path: other_worktree,
+                phase: ActionRunPhase::Running,
+                output: String::new(),
+                exit_code: None,
+                managed: false,
+            },
+        );
+        assert_eq!(state.save_action(action.clone()).unwrap_err(), expected);
+        assert_eq!(
+            state.remove_repository(repository_id).unwrap_err(),
+            repository_expected
+        );
+
+        state
+            .lock()
+            .unwrap()
+            .action_runs
+            .get_mut(&key)
+            .unwrap()
+            .phase = ActionRunPhase::Succeeded;
+        state.save_action(action).unwrap();
+        assert_eq!(
+            state.store.load().unwrap().value.custom_actions[0].name,
+            "Changed"
+        );
+    }
+
+    #[test]
+    fn composed_external_runs_are_guarded_without_synthetic_memory_state() {
+        let (_directory, state, mut action, worktree) = action_confirmation_fixture();
+        action.kind = CustomActionKind::Session;
+        action.detects_running_worktree_listener = true;
+        state.store.save_custom_action(action.clone()).unwrap();
+        let snapshot = state
+            .compose_status(
+                ProcessObservation {
+                    availability: DiscoveryAvailability::available(),
+                    processes: vec![ObservedProcess {
+                        identity: current_process_identity().unwrap(),
+                        name: "external-listener".into(),
+                        cwd: Some(worktree),
+                        ports: vec![runtime_atlas_core::models::ListeningPort {
+                            address: "127.0.0.1".into(),
+                            port: 3000,
+                        }],
+                    }],
+                    notices: Vec::new(),
+                },
+                empty_docker_observation(),
+            )
+            .unwrap();
+
+        assert!(snapshot.action_runs.iter().any(|run| {
+            run.action_id == action.id && run.phase == ActionRunPhase::Running && !run.managed
+        }));
+        assert!(state.lock().unwrap().action_runs.is_empty());
+        assert!(
+            state
+                .ensure_actions_inactive(&snapshot, &[action.id])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ambiguous_markers_block_mutation_and_ordinary_exit() {
+        let (_directory, state, mut action, _worktree) = action_confirmation_fixture();
+        fs::write(state.marker_path(Uuid::new_v4()), b"{ambiguous-marker").unwrap();
+        action.name = "Changed".into();
+
+        assert_eq!(
+            state.save_action(action).unwrap_err(),
+            "action session markers cannot be verified safely"
+        );
+        assert_eq!(
+            state.shutdown_for_exit().unwrap_err(),
+            "action session markers cannot be verified safely"
+        );
+        assert!(state.require_actions_available().is_ok());
+    }
+
+    #[test]
     fn malformed_sessions_fail_closed_for_stop_run_and_update() {
         let (_directory, state, mut action, worktree) = action_confirmation_fixture();
         action.kind = CustomActionKind::Session;
@@ -3349,6 +3638,21 @@ mod tests {
         );
         state.cancel_update_shutdown();
         assert!(state.require_actions_available().is_ok());
+    }
+
+    #[test]
+    fn ordinary_exit_is_idempotent_after_successful_update_shutdown() {
+        let directory = tempdir().unwrap();
+        let state =
+            RuntimeAtlasState::new(directory.path().join("Runtime Atlas"), AppLanguage::English)
+                .unwrap();
+
+        state.shutdown_for_update().unwrap();
+        assert!(state.shutdown_for_exit().is_ok());
+        assert_eq!(
+            state.shutdown_for_update().unwrap_err(),
+            "Runtime Atlas update shutdown is already active"
+        );
     }
 
     #[test]

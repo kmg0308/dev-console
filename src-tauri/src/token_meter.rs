@@ -172,7 +172,11 @@ pub fn token_meter_set_sync_folder(
             return Err("Source configuration is disabled in updater QA.".to_owned());
         }
         state.with_settings(|settings| {
-            settings.sync_folder_path = checked_path(path, PathKind::Directory)?;
+            let path = checked_path(path, PathKind::Directory)?;
+            if let Some(path) = path.as_deref() {
+                state.prepare_icloud_sync_folder_if_default(Path::new(path))?;
+            }
+            settings.sync_folder_path = path;
             settings
                 .save(&state.settings_path())
                 .map_err(string_error)?;
@@ -307,7 +311,7 @@ impl TokenMeterState {
             )
                 })
         };
-        compose_dashboard(
+        let mut dashboard = compose_dashboard(
             request,
             &scan,
             &settings,
@@ -317,8 +321,9 @@ impl TokenMeterState {
             &Local,
             current_first_weekday()?,
         )
-        .map(DashboardSnapshotDto::from)
-        .map_err(string_error)
+        .map_err(string_error)?;
+        dashboard.settings.icloud_sync_folder_path = self.icloud_sync_folder_path();
+        Ok(DashboardSnapshotDto::from(dashboard))
     }
 
     fn scan(
@@ -343,12 +348,20 @@ impl TokenMeterState {
         if self.source_isolation_root.is_none()
             && let Some(folder) = settings.sync_folder_path.as_deref()
         {
+            let scan_complete = scan.parse_error_count == 0;
             let outcome = TokenSyncStore::new(folder, local_device.clone()).synchronize(
-                &scan.events,
-                rebuild_cache,
+                if scan_complete { &scan.events } else { &[] },
+                rebuild_cache && scan_complete,
                 None,
                 || false,
             );
+            let mut outcome = outcome;
+            if !scan_complete {
+                outcome.status.export_error = Some(
+                    "Local sync export was skipped because token source scanning was incomplete."
+                        .to_owned(),
+                );
+            }
             scan.events = merge_local_and_sync(scan.events, outcome.events);
             scan.sync_status = outcome.status;
             scan.sync_devices = devices(&scan.events);
@@ -508,6 +521,7 @@ impl TokenMeterState {
         DashboardSettings {
             show_full_token_numbers: settings.show_full_token_numbers,
             sync_folder_path: settings.sync_folder_path.clone(),
+            icloud_sync_folder_path: self.icloud_sync_folder_path(),
             local_device_id: settings.local_device_id.clone(),
             local_device_name: self.local_device_name.clone(),
             codex_home: settings.codex_home.clone(),
@@ -515,6 +529,65 @@ impl TokenMeterState {
             hermes_database_path: settings.hermes_database_path.clone(),
             codex_executable_path: settings.codex_executable_path.clone(),
         }
+    }
+
+    fn icloud_sync_folder_path(&self) -> Option<String> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.source_isolation_root.is_some() {
+                return None;
+            }
+            let home = fs::canonicalize(&self.home_dir).ok()?;
+            let mut root = self.home_dir.clone();
+            for component in ["Library", "Mobile Documents", "com~apple~CloudDocs"] {
+                root.push(component);
+                let metadata = fs::symlink_metadata(&root).ok()?;
+                if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                    return None;
+                }
+            }
+            let canonical_root = fs::canonicalize(&root).ok()?;
+            if !canonical_root.starts_with(home) {
+                return None;
+            }
+            let folder = root.join("TokenMeter");
+            match fs::symlink_metadata(&folder) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return None,
+            }
+            folder.into_os_string().into_string().ok()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn prepare_icloud_sync_folder_if_default(&self, path: &Path) -> Result<(), String> {
+        #[cfg(target_os = "macos")]
+        {
+            let expected = self
+                .home_dir
+                .join("Library/Mobile Documents/com~apple~CloudDocs/TokenMeter");
+            if path != expected {
+                return Ok(());
+            }
+            if self.icloud_sync_folder_path().as_deref() != expected.to_str() {
+                return Err("The iCloud Drive sync folder is unavailable or unsafe.".to_owned());
+            }
+            match fs::create_dir(&expected) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            if self.icloud_sync_folder_path().as_deref() != expected.to_str() {
+                return Err("The iCloud Drive sync folder is unavailable or unsafe.".to_owned());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = path;
+        Ok(())
     }
 
     fn account_executable<'a>(&'a self, settings: &'a TokenMeterSettings) -> Option<&'a OsStr> {
@@ -854,6 +927,94 @@ mod tests {
     }
 
     #[test]
+    fn icloud_sync_folder_is_platform_verified_before_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(state.icloud_sync_folder_path(), None);
+            let path = directory.path().join("iCloud/TokenMeter");
+            state.prepare_icloud_sync_folder_if_default(&path).unwrap();
+            assert!(!path.exists());
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::symlink;
+
+            let mut state = state;
+            let root = state
+                .home_dir
+                .join("Library/Mobile Documents/com~apple~CloudDocs");
+            let expected = root.join("TokenMeter");
+            assert_eq!(state.icloud_sync_folder_path(), None);
+            fs::create_dir_all(&root).unwrap();
+            assert_eq!(
+                state.icloud_sync_folder_path().as_deref(),
+                expected.to_str()
+            );
+
+            let other = directory.path().join("other");
+            state.prepare_icloud_sync_folder_if_default(&other).unwrap();
+            assert!(!other.exists());
+
+            fs::write(&expected, b"not a directory").unwrap();
+            assert_eq!(state.icloud_sync_folder_path(), None);
+            assert!(
+                state
+                    .prepare_icloud_sync_folder_if_default(&expected)
+                    .is_err()
+            );
+            fs::remove_file(&expected).unwrap();
+
+            state
+                .prepare_icloud_sync_folder_if_default(&expected)
+                .unwrap();
+            assert!(expected.is_dir());
+            fs::remove_dir(&expected).unwrap();
+
+            let outside = directory.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            symlink(&outside, &expected).unwrap();
+            assert_eq!(state.icloud_sync_folder_path(), None);
+            assert!(
+                state
+                    .prepare_icloud_sync_folder_if_default(&expected)
+                    .is_err()
+            );
+            fs::remove_file(&expected).unwrap();
+
+            state.source_isolation_root = Some(directory.path().join("updater-qa"));
+            assert_eq!(state.icloud_sync_folder_path(), None);
+            assert!(
+                state
+                    .prepare_icloud_sync_folder_if_default(&expected)
+                    .is_err()
+            );
+            state.source_isolation_root = None;
+
+            fs::remove_dir(&root).unwrap();
+            let mobile_documents = root.parent().unwrap();
+            fs::remove_dir(mobile_documents).unwrap();
+            let escaped_mobile_documents = directory.path().join("outside-mobile-documents");
+            fs::create_dir_all(escaped_mobile_documents.join("com~apple~CloudDocs")).unwrap();
+            symlink(&escaped_mobile_documents, mobile_documents).unwrap();
+            assert_eq!(state.icloud_sync_folder_path(), None);
+            assert!(
+                state
+                    .prepare_icloud_sync_folder_if_default(&expected)
+                    .is_err()
+            );
+            assert!(
+                !escaped_mobile_documents
+                    .join("com~apple~CloudDocs/TokenMeter")
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
     fn updater_qa_uses_only_identifier_scoped_data_and_source_roots() {
         let directory = tempfile::tempdir().unwrap();
         let local_data = directory.path().join("Library/Application Support");
@@ -1090,6 +1251,83 @@ mod tests {
     #[test]
     fn native_device_name_or_fallback_is_not_empty() {
         assert!(!local_device_name().is_empty());
+    }
+
+    #[test]
+    fn incomplete_source_scan_preserves_the_local_sync_ledger_exactly() {
+        use chrono::TimeZone;
+        use token_meter_core::{
+            models::{TokenSource, TokenUsage},
+            sync::{SyncLedgerRecord, rewrite_local_ledger_v2},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let codex_home = directory.path().join("codex");
+        let archive = codex_home.join("archived_sessions/valid.jsonl");
+        let sync = directory.path().join("sync");
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::create_dir(&sync).unwrap();
+        fs::write(codex_home.join("sessions"), b"not a directory").unwrap();
+        fs::write(
+            &archive,
+            concat!(
+                "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",",
+                "\"payload\":{\"cwd\":\"/tmp/project\",\"model\":\"gpt\",",
+                "\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"total_tokens\":10},",
+                "\"total_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut settings = state.load_settings().unwrap();
+        settings.codex_home = Some(codex_home.to_string_lossy().into_owned());
+        settings.sync_folder_path = Some(sync.to_string_lossy().into_owned());
+        settings.save(&state.settings_path()).unwrap();
+        let store = TokenSyncStore::new(
+            &sync,
+            TokenDeviceMetadata::new(
+                settings.local_device_id.clone(),
+                state.local_device_name.clone(),
+            ),
+        );
+        rewrite_local_ledger_v2(
+            &store.local_ledger_path(),
+            [SyncLedgerRecord::v2(
+                settings.local_device_id.clone(),
+                state.local_device_name.clone(),
+                "preserved-event".into(),
+                Utc.with_ymd_and_hms(2025, 12, 31, 0, 0, 0).unwrap(),
+                TokenSource::Codex,
+                "gpt".into(),
+                "/private/preserved",
+                "preserved-session",
+                TokenUsage {
+                    input: 20,
+                    total: 20,
+                    ..TokenUsage::default()
+                },
+            )],
+        )
+        .unwrap();
+        let before = fs::read(store.local_ledger_path()).unwrap();
+
+        let scan = state.scan(&settings, true).unwrap();
+
+        assert!(scan.parse_error_count > 0);
+        assert_eq!(fs::read(store.local_ledger_path()).unwrap(), before);
+        assert!(
+            scan.sync_status
+                .export_error
+                .as_deref()
+                .is_some_and(|error| error.contains("scanning was incomplete"))
+        );
+        assert!(scan.events.iter().any(|event| event.usage.total == 10));
+        assert!(
+            scan.events
+                .iter()
+                .any(|event| event.id == "preserved-event")
+        );
     }
 
     #[test]

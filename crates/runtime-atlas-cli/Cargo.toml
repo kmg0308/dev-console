@@ -8,10 +8,12 @@ name = "runtime-atlas"
 path = "src/main.rs"
 
 [dependencies]
+chrono.workspace = true
 runtime-atlas-core = { path = "../runtime-atlas-core" }
 serde.workspace = true
 serde_json.workspace = true
 sys-locale.workspace = true
+uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

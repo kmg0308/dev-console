@@ -1,4 +1,5 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { pickDirectory } from "../../folder-dialog";
 import "./RuntimeAtlas.css";
 import {
   ActionConfirmationPlan,
@@ -140,6 +141,15 @@ export function RuntimeAtlas() {
     setRepositoryPath("");
   };
 
+  const chooseRepository = async () => {
+    try {
+      const path = await pickDirectory();
+      if (path) setRepositoryPath(path);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
   const selectWorktree = (path: string) => {
     navigationStartPath.current = undefined;
     selectedPathRef.current = path;
@@ -181,6 +191,16 @@ export function RuntimeAtlas() {
         </div>
       )}
 
+      {snapshot.notices.map((notice, index) => (
+        <Notice key={`${notice.kind}-${index}`} kind={notice.kind} title={notice.kind === "error" ? text("로컬 데이터 문제", "Local data issue") : text("알림", "Notice")} message={notice.message} />
+      ))}
+      {snapshot.processDiscovery.state === "unavailable" && (
+        <Notice kind="warning" title={text("프로세스 탐색 일부 실패", "Process discovery unavailable")} message={snapshot.processDiscovery.reason || text("수신 포트 프로세스를 읽지 못했습니다.", "Listening processes could not be read.")} />
+      )}
+      {snapshot.dockerDiscovery.state === "unavailable" && (
+        <Notice kind="warning" title={text("Docker 탐색 일부 실패", "Docker discovery unavailable")} message={snapshot.dockerDiscovery.reason || text("Docker 상태를 읽지 못했습니다.", "Docker state could not be read.")} />
+      )}
+
       <div className="atlas-layout">
         <aside className="atlas-sidebar" aria-label={text("저장소와 워크트리", "Repositories and worktrees") }>
           <div className="atlas-sidebar-title">
@@ -189,6 +209,7 @@ export function RuntimeAtlas() {
           </div>
           <form className="atlas-add-repository" onSubmit={addRepository}>
             <label htmlFor="atlas-repository-path">{text("Git 저장소 경로", "Git repository path")}</label>
+            <button type="button" disabled={busy} onClick={() => void chooseRepository()}>{text("폴더 선택…", "Choose Folder…")}</button>
             <div>
               <input
                 id="atlas-repository-path"
@@ -365,16 +386,6 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, mutate, 
       {worktree.availability === "unavailable" && (
         <Notice kind="error" title={text("워크트리를 확인할 수 없습니다.", "Worktree unavailable")} message={worktree.unavailableReason || text("Git이 이 워크트리를 검사하지 못했습니다.", "Git could not inspect this worktree.")} />
       )}
-      {snapshot.notices.map((notice, index) => (
-        <Notice key={`${notice.kind}-${index}`} kind={notice.kind} title={notice.kind === "error" ? text("로컬 데이터 문제", "Local data issue") : text("알림", "Notice")} message={notice.message} />
-      ))}
-      {snapshot.processDiscovery.state === "unavailable" && (
-        <Notice kind="warning" title={text("프로세스 탐색 일부 실패", "Process discovery unavailable")} message={snapshot.processDiscovery.reason || text("수신 포트 프로세스를 읽지 못했습니다.", "Listening processes could not be read.")} />
-      )}
-      {snapshot.dockerDiscovery.state === "unavailable" && (
-        <Notice kind="warning" title={text("Docker 탐색 일부 실패", "Docker discovery unavailable")} message={snapshot.dockerDiscovery.reason || text("Docker 상태를 읽지 못했습니다.", "Docker state could not be read.")} />
-      )}
-
       <section className="atlas-card" aria-labelledby="atlas-actions-title">
         <header>
           <div><h4 id="atlas-actions-title">{text("사용자 작업", "Custom actions")}</h4><p>{text("선택한 워크트리에서 명시적으로 실행합니다.", "Run explicitly in the selected worktree.")}</p></div>
@@ -518,13 +529,13 @@ function ActionRow({ action, run, worktree, allWorktrees, korean, busy, mutate, 
           <label key={input.id}>{input.label || input.key}<input value={String(values[input.key] || "")} onChange={(event) => setValues({ ...values, [input.key]: event.target.value })} /></label>
         ))}
       </div>}
-      {run && <p className={`atlas-action-status ${run.phase}`} aria-live="polite">{run.phase}{run.exitCode !== null ? ` (${run.exitCode})` : ""}</p>}
+      {run && <p className={`atlas-action-status ${run.phase}`} aria-live="polite">{run.managed ? run.phase : text("외부 · 실행 중", "External · Running")}{run.exitCode !== null ? ` (${run.exitCode})` : ""}</p>}
       {planError && <p className="atlas-action-error" role="alert">{planError}</p>}
       {run?.output && <details><summary>{text("출력", "Output")}</summary><pre>{run.output}</pre></details>}
       <div className="atlas-row-actions">
         <button type="button" onClick={edit} disabled={busy || planning || ["pending", "running"].includes(run?.phase || "")}>{text("편집", "Edit")}</button>
         <button type="button" onClick={() => void execute(false)} disabled={busy || planning || worktree.availability !== "available" || ["pending", "running"].includes(run?.phase || "")}>{planning ? text("검토 준비 중…", "Preparing review…") : action.kind === "session" ? text("시작", "Start") : text("실행", "Run")}</button>
-        {action.kind === "session" && action.restartCommandTemplate && run?.phase === "running" && <button type="button" onClick={() => void execute(true)} disabled={busy || planning || worktree.availability !== "available"}>{text("재시작", "Restart")}</button>}
+        {action.kind === "session" && action.restartCommandTemplate && run?.managed && run.phase === "running" && <button type="button" onClick={() => void execute(true)} disabled={busy || planning || worktree.availability !== "available"}>{text("재시작", "Restart")}</button>}
         {action.kind === "session" && run?.managed && ["pending", "running", "restarting", "stopping"].includes(run.phase) && <button type="button" className="danger-text" disabled={busy} onClick={() => void mutate(() => runtimeAtlasCommands.stopAction(action.id, worktree.path))}>{text("중지", "Stop")}</button>}
         <button type="button" className="danger-text" disabled={busy || ["pending", "running"].includes(run?.phase || "")} onClick={() => {
           if (window.confirm(text(`${action.name} 작업을 삭제할까요?`, `Delete ${action.name}?`))) void mutate(() => runtimeAtlasCommands.deleteAction(action.id));
@@ -634,7 +645,7 @@ function ActionEditor({ action, korean, close, save }: {
         <div className="atlas-dialog-fields">
           <label>{text("이름", "Name")}<input autoFocus required value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
           <label>{text("명령 템플릿", "Command template")}<input required placeholder="npm run dev" value={draft.commandTemplate} onChange={(event) => setDraft({ ...draft, commandTemplate: event.target.value })} /></label>
-          <label>{text("작업 종류", "Action kind")}<select value={draft.kind} onChange={(event) => { const kind = event.target.value as CustomAction["kind"]; setDraft({ ...draft, kind, restartCommandTemplate: kind === "task" ? null : draft.restartCommandTemplate, detectsRunningWorktreeListener: kind === "session" && draft.workingDirectory === "selectedWorktree" && draft.detectsRunningWorktreeListener }); }}><option value="task">{text("일회성 작업", "One-time task")}</option><option value="session">{text("실행 세션", "Running session")}</option></select></label>
+          <label>{text("작업 종류", "Action kind")}<select value={draft.kind} onChange={(event) => { const kind = event.target.value as CustomAction["kind"]; setDraft({ ...draft, kind, restartCommandTemplate: kind === "task" ? null : draft.restartCommandTemplate, detectsRunningWorktreeListener: kind === "session" && draft.workingDirectory === "selectedWorktree" }); }}><option value="task">{text("일회성 작업", "One-time task")}</option><option value="session">{text("실행 세션", "Running session")}</option></select></label>
           {draft.kind === "session" && <label>{text("재시작 명령(선택)", "Restart command (optional)")}<input value={draft.restartCommandTemplate || ""} onChange={(event) => setDraft({ ...draft, restartCommandTemplate: event.target.value || null })} /></label>}
           <label>{text("실행 위치", "Run from")}<select value={draft.workingDirectory} onChange={(event) => { const workingDirectory = event.target.value as CustomAction["workingDirectory"]; setDraft({ ...draft, workingDirectory, detectsRunningWorktreeListener: draft.kind === "session" && workingDirectory === "selectedWorktree" && draft.detectsRunningWorktreeListener }); }}><option value="selectedWorktree">{text("선택한 워크트리", "Selected worktree")}</option><option value="repositoryRoot">{text("저장소 루트", "Repository root")}</option></select></label>
           <label className="atlas-checkbox"><input type="checkbox" checked={draft.risk === "destructive"} onChange={(event) => setDraft({ ...draft, risk: event.target.checked ? "destructive" : "normal" })} />{text("파괴적 작업", "Destructive action")}</label>

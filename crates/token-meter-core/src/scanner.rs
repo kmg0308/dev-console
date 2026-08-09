@@ -514,22 +514,34 @@ fn enumerate_jsonl(
     source: TokenSource,
     is_cancelled: &impl Fn() -> bool,
 ) -> Enumeration {
-    if !root.exists() {
-        return Enumeration {
-            files: Vec::new(),
-            completed: true,
-            error_count: 0,
-        };
-    }
-    if !root.is_dir() {
-        return Enumeration {
-            files: Vec::new(),
-            completed: false,
-            error_count: 1,
-        };
+    match fs::metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Enumeration {
+                files: Vec::new(),
+                completed: true,
+                error_count: 0,
+            };
+        }
+        Err(_) => {
+            return Enumeration {
+                files: Vec::new(),
+                completed: false,
+                error_count: 1,
+            };
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Enumeration {
+                files: Vec::new(),
+                completed: false,
+                error_count: 1,
+            };
+        }
+        Ok(_) => {}
     }
     let mut paths = vec![root.to_owned()];
     let mut files = Vec::new();
+    let mut completed = true;
+    let mut error_count = 0;
     while let Some(directory) = paths.pop() {
         if is_cancelled() {
             return Enumeration {
@@ -584,9 +596,13 @@ fn enumerate_jsonl(
             }
             let path = entry.path();
             let Ok(metadata) = fs::metadata(&path) else {
+                completed = false;
+                error_count += 1;
                 continue;
             };
             let Ok(modified) = metadata.modified() else {
+                completed = false;
+                error_count += 1;
                 continue;
             };
             let modified_at: DateTime<Utc> = modified.into();
@@ -614,8 +630,8 @@ fn enumerate_jsonl(
     });
     Enumeration {
         files,
-        completed: true,
-        error_count: 0,
+        completed,
+        error_count,
     }
 }
 
@@ -700,6 +716,22 @@ mod tests {
         assert_eq!(result.claude_file_count, 45);
         assert_eq!(result.events.len(), 45);
         assert_eq!(result.parse_error_count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_metadata_failure_is_an_incomplete_scan() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("loop");
+        symlink(&root, &root).unwrap();
+
+        let enumeration = enumerate_jsonl(&root, TokenSource::Codex, &|| false);
+
+        assert!(!enumeration.completed);
+        assert_eq!(enumeration.error_count, 1);
+        assert!(enumeration.files.is_empty());
     }
 
     #[test]

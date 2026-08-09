@@ -195,14 +195,15 @@ pub fn write_local_ledger_v2(
         if records.is_empty() {
             return Ok(0);
         }
-        let (identity, replace_legacy) = local_ledger_state(path)?;
+        let (existing, replace_legacy) = local_ledger_state(path)?;
         if replace_existing || replace_legacy {
             if is_cancelled() {
                 return Ok(0);
             }
-            rewrite_local_ledger_v2_unlocked(path, &records, identity, boundary)?;
+            rewrite_local_ledger_v2_unlocked(path, &records, existing, boundary)?;
             Ok(records.len())
         } else {
+            drop(existing);
             append_new_v2_records_unlocked(path, records, is_cancelled, boundary)
         }
     })
@@ -217,8 +218,8 @@ pub fn rewrite_local_ledger_v2(
         return Ok(0);
     }
     with_ledger_lock(path, |boundary| {
-        let (identity, _) = local_ledger_state(path)?;
-        rewrite_local_ledger_v2_unlocked(path, &records, identity, boundary)
+        let (existing, _) = local_ledger_state(path)?;
+        rewrite_local_ledger_v2_unlocked(path, &records, existing, boundary)
     })?;
     Ok(records.len())
 }
@@ -226,35 +227,290 @@ pub fn rewrite_local_ledger_v2(
 fn rewrite_local_ledger_v2_unlocked(
     path: &Path,
     records: &[SyncLedgerRecord],
-    expected_identity: Option<FileIdentity>,
+    existing: Option<OpenedLedger>,
     boundary: &LedgerBoundary,
 ) -> Result<(), SyncError> {
+    rewrite_local_ledger_v2_unlocked_with(path, records, existing, boundary, || Ok(()))
+}
+
+fn rewrite_local_ledger_v2_unlocked_with(
+    path: &Path,
+    records: &[SyncLedgerRecord],
+    existing: Option<OpenedLedger>,
+    boundary: &LedgerBoundary,
+    before_replace: impl FnOnce() -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    let expected_identity = existing.as_ref().map(|opened| opened.identity);
     let temp = temporary_sibling(path);
-    let mut replacement_started = false;
+    #[cfg(target_os = "windows")]
+    let mut owned_temp_identity = None;
+    #[cfg(target_os = "macos")]
+    let mut owned_temp_identity = None;
+    #[cfg(target_os = "macos")]
+    let mut namespace_mutated = false;
     let result = (|| -> Result<(), SyncError> {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         boundary.validate_target(path, expected_identity)?;
         let (mut file, temp_identity) = open_regular_nofollow(&temp, &mut options)?;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            owned_temp_identity = Some(temp_identity);
+        }
         boundary.validate_target(&temp, Some(temp_identity))?;
         write_lines(&mut file, records)?;
         file.sync_all()?;
-        drop(file);
+        #[cfg(target_os = "macos")]
+        let temp_probe = OpenedLedger {
+            file,
+            identity: temp_identity,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let temp_probe = {
+            drop(file);
+            open_regular_replace_probe(&temp)?
+        };
+        if temp_probe.identity != temp_identity {
+            return Err(identity_changed("temporary sync ledger changed after writing").into());
+        }
         boundary.validate_target(path, expected_identity)?;
         boundary.validate_target(&temp, Some(temp_identity))?;
-        replacement_started = true;
-        crate::atomic_file::replace(&temp, path)?;
-        boundary.validate(path)?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        let (_, identity) = open_regular_nofollow(path, &mut options)?;
-        boundary.validate_target(path, Some(identity))?;
+        before_replace()?;
+        #[cfg(target_os = "macos")]
+        replace_ledger_identity_bound(
+            &temp,
+            path,
+            &temp_probe,
+            existing.as_ref(),
+            boundary,
+            &mut namespace_mutated,
+        )?;
+        #[cfg(not(target_os = "macos"))]
+        replace_ledger_identity_bound(&temp, path, &temp_probe, existing.as_ref(), boundary)?;
         Ok(())
     })();
-    if result.is_err() && (!replacement_started || path.exists()) {
-        let _ = fs::remove_file(&temp);
+    #[cfg(target_os = "macos")]
+    if result.is_err()
+        && !namespace_mutated
+        && let Some(identity) = owned_temp_identity
+    {
+        let _ = remove_checked_temp(boundary, &temp, identity);
+    }
+    #[cfg(target_os = "windows")]
+    if result.is_err()
+        && let Some(identity) = owned_temp_identity
+    {
+        let _ = remove_exact_leaf(boundary, &temp, identity);
     }
     result
+}
+
+#[cfg(target_os = "macos")]
+fn replace_ledger_identity_bound(
+    temp: &Path,
+    destination: &Path,
+    temp_probe: &OpenedLedger,
+    existing: Option<&OpenedLedger>,
+    boundary: &LedgerBoundary,
+    namespace_mutated: &mut bool,
+) -> Result<(), SyncError> {
+    if let Some(existing) = existing {
+        renameatx(boundary, temp, destination, libc::RENAME_SWAP)?;
+        *namespace_mutated = true;
+        let destination_after = open_regular_replace_probe(destination)?;
+        let displaced_after = open_regular_replace_probe(temp)?;
+        if destination_after.identity == temp_probe.identity
+            && displaced_after.identity == existing.identity
+        {
+            remove_checked_temp(boundary, temp, existing.identity)?;
+            return Ok(());
+        }
+
+        boundary.validate_target(destination, Some(destination_after.identity))?;
+        boundary.validate_target(temp, Some(displaced_after.identity))?;
+        renameatx(boundary, temp, destination, libc::RENAME_SWAP)?;
+        boundary.validate_target(destination, Some(displaced_after.identity))?;
+        boundary.validate_target(temp, Some(destination_after.identity))?;
+        if destination_after.identity == temp_probe.identity {
+            remove_checked_temp(boundary, temp, temp_probe.identity)?;
+        }
+        return Err(identity_changed("sync ledger destination changed during replacement").into());
+    }
+
+    renameatx(boundary, temp, destination, libc::RENAME_EXCL)?;
+    *namespace_mutated = true;
+    boundary.validate_target(destination, Some(temp_probe.identity))?;
+    boundary._devices_file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_checked_temp(
+    boundary: &LedgerBoundary,
+    path: &Path,
+    expected: FileIdentity,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    boundary.validate(path)?;
+    let opened = open_regular_replace_probe(path)?;
+    if opened.identity != expected {
+        return Err(identity_changed(
+            "temporary sync ledger identity changed before cleanup",
+        ));
+    }
+    boundary.validate_target(path, Some(expected))?;
+    let leaf = leaf_cstring(path)?;
+    // ponytail: this relies on the agreed non-malicious cloud-writer boundary for our unique leaf.
+    // SAFETY: the checked leaf is relative to the verified, held devices directory handle.
+    if unsafe { libc::unlinkat(boundary._devices_file.as_raw_fd(), leaf.as_ptr(), 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    boundary._devices_file.sync_all()
+}
+
+#[cfg(target_os = "macos")]
+fn renameatx(
+    boundary: &LedgerBoundary,
+    source: &Path,
+    destination: &Path,
+    flags: libc::c_uint,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let source = leaf_cstring(source)?;
+    let destination = leaf_cstring(destination)?;
+    // SAFETY: both names are direct NUL-terminated leaves relative to the held devices dirfd.
+    if unsafe {
+        libc::renameatx_np(
+            boundary._devices_file.as_raw_fd(),
+            source.as_ptr(),
+            boundary._devices_file.as_raw_fd(),
+            destination.as_ptr(),
+            flags,
+        )
+    } == -1
+    {
+        Err(map_race_safe_rename_error(io::Error::last_os_error()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn map_race_safe_rename_error(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ENOTSUP) || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+    {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "race-safe sync ledger replacement is unsupported by this filesystem",
+        )
+    } else {
+        error
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn replace_ledger_identity_bound(
+    temp: &Path,
+    destination: &Path,
+    temp_probe: &OpenedLedger,
+    existing: Option<&OpenedLedger>,
+    boundary: &LedgerBoundary,
+) -> Result<(), SyncError> {
+    let Some(existing) = existing else {
+        fs::rename(temp, destination)?;
+        let destination_after = open_regular_replace_probe(destination)?;
+        if destination_after.identity != temp_probe.identity {
+            return Err(
+                identity_changed("sync ledger destination changed during replacement").into(),
+            );
+        }
+        boundary.validate_target(destination, Some(temp_probe.identity))?;
+        return Ok(());
+    };
+
+    let backup = recovery_sibling(destination, "backup");
+    boundary.validate_target(&backup, None)?;
+    replace_file_windows(temp, destination, &backup)?;
+    let destination_after = open_regular_replace_probe(destination)?;
+    let displaced_after = open_regular_replace_probe(&backup)?;
+    if destination_after.identity == temp_probe.identity
+        && displaced_after.identity == existing.identity
+    {
+        remove_exact_leaf(boundary, &backup, existing.identity)?;
+        return Ok(());
+    }
+
+    let rollback = recovery_sibling(destination, "rollback");
+    boundary.validate_target(&rollback, None)?;
+    let destination_identity = destination_after.identity;
+    let displaced_identity = displaced_after.identity;
+    boundary.validate_target(destination, Some(destination_identity))?;
+    boundary.validate_target(&backup, Some(displaced_identity))?;
+    replace_file_windows(&backup, destination, &rollback)?;
+    boundary.validate_target(destination, Some(displaced_identity))?;
+    boundary.validate_target(&rollback, Some(destination_identity))?;
+    if destination_identity == temp_probe.identity {
+        remove_exact_leaf(boundary, &rollback, temp_probe.identity)?;
+    }
+    Err(identity_changed("sync ledger destination changed during replacement").into())
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file_windows(replacement: &Path, destination: &Path, backup: &Path) -> io::Result<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    let replacement = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let backup = backup
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: all three paths are valid NUL-terminated UTF-16 buffers for this call.
+    if unsafe {
+        ReplaceFileW(
+            destination.as_ptr(),
+            replacement.as_ptr(),
+            backup.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn replace_ledger_identity_bound(
+    temp: &Path,
+    destination: &Path,
+    temp_probe: &OpenedLedger,
+    _: Option<&OpenedLedger>,
+    boundary: &LedgerBoundary,
+) -> Result<(), SyncError> {
+    fs::rename(temp, destination)?;
+    boundary.validate_target(destination, Some(temp_probe.identity))?;
+    boundary._devices_file.sync_all()?;
+    Ok(())
+}
+
+fn identity_changed(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 pub fn append_new_v2_records(
@@ -399,6 +655,11 @@ fn write_lines(writer: &mut impl Write, records: &[SyncLedgerRecord]) -> Result<
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity(u64, u64);
 
+struct OpenedLedger {
+    file: fs::File,
+    identity: FileIdentity,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NodeKind {
     File,
@@ -504,14 +765,20 @@ impl LedgerBoundary {
     }
 }
 
-fn local_ledger_state(path: &Path) -> Result<(Option<FileIdentity>, bool), SyncError> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    let Some((mut file, identity)) = open_optional_regular_nofollow(path, &mut options)? else {
+fn local_ledger_state(path: &Path) -> Result<(Option<OpenedLedger>, bool), SyncError> {
+    let Some(mut opened) = open_optional_regular_replace_probe(path)? else {
         return Ok((None, false));
     };
-    let replace = requires_local_ledger_replacement_file(&mut file)?;
-    Ok((Some(identity), replace))
+    let replace = requires_local_ledger_replacement_file(&mut opened.file)?;
+    Ok((Some(opened), replace))
+}
+
+fn open_optional_regular_replace_probe(path: &Path) -> io::Result<Option<OpenedLedger>> {
+    match open_regular_replace_probe(path) {
+        Ok(opened) => Ok(Some(opened)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn open_optional_regular_nofollow(
@@ -523,6 +790,36 @@ fn open_optional_regular_nofollow(
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn open_regular_replace_probe(path: &Path) -> io::Result<OpenedLedger> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let (file, identity) = open_node_replace_compatible(path, &mut options)?;
+    Ok(OpenedLedger { file, identity })
+}
+
+fn open_node_replace_compatible(
+    path: &Path,
+    options: &mut OpenOptions,
+) -> io::Result<(fs::File, FileIdentity)> {
+    configure_replace_compatible(options);
+    let file = options.open(path)?;
+    let identity = node_identity(&file, NodeKind::File)?;
+    if current_replace_compatible_identity(path)? != identity {
+        return Err(identity_changed(
+            "sync ledger path changed while it was opened",
+        ));
+    }
+    Ok((file, identity))
+}
+
+fn current_replace_compatible_identity(path: &Path) -> io::Result<FileIdentity> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_replace_compatible(&mut options);
+    let file = options.open(path)?;
+    node_identity(&file, NodeKind::File)
 }
 
 fn open_regular_nofollow(
@@ -598,6 +895,11 @@ fn configure_nofollow(options: &mut OpenOptions, _: NodeKind) {
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 }
 
+#[cfg(unix)]
+fn configure_replace_compatible(options: &mut OpenOptions) {
+    configure_nofollow(options, NodeKind::File);
+}
+
 #[cfg(target_os = "windows")]
 fn configure_nofollow(options: &mut OpenOptions, kind: NodeKind) {
     use std::os::windows::fs::OpenOptionsExt;
@@ -612,6 +914,17 @@ fn configure_nofollow(options: &mut OpenOptions, kind: NodeKind) {
     options
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | directory_flag)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+}
+
+#[cfg(target_os = "windows")]
+fn configure_replace_compatible(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    options
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
 }
 
 #[cfg(unix)]
@@ -703,7 +1016,83 @@ fn temporary_sibling(path: &Path) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    path.with_extension(format!("tmp-{}-{nonce}", std::process::id()))
+    #[cfg(target_os = "macos")]
+    {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(path.file_name().unwrap_or(std::ffi::OsStr::new("ledger")));
+        name.push(format!(".tmp-{}-{nonce}", std::process::id()));
+        path.with_file_name(name)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        path.with_extension(format!("tmp-{}-{nonce}", std::process::id()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn recovery_sibling(path: &Path, role: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("{role}-{}-{nonce}", std::process::id()))
+}
+
+#[cfg(target_os = "macos")]
+fn leaf_cstring(path: &Path) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let leaf = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "sync ledger leaf is missing")
+    })?;
+    std::ffi::CString::new(leaf.as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sync ledger leaf contains a NUL byte",
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn remove_exact_leaf(
+    boundary: &LedgerBoundary,
+    path: &Path,
+    expected: FileIdentity,
+) -> io::Result<()> {
+    use std::{mem::size_of, os::windows::fs::OpenOptionsExt, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO_EX, FILE_READ_ATTRIBUTES, FileDispositionInfoEx,
+        SetFileInformationByHandle,
+    };
+
+    boundary.validate_target(path, Some(expected))?;
+    let mut options = OpenOptions::new();
+    options.access_mode(DELETE | FILE_READ_ATTRIBUTES);
+    let (file, identity) = open_node_replace_compatible(path, &mut options)?;
+    if identity != expected {
+        return Err(identity_changed(
+            "temporary sync ledger identity changed before cleanup",
+        ));
+    }
+    boundary.validate(path)?;
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: the verified file handle has DELETE access and the typed buffer has exact size.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            (&raw const disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 mod canonical_timestamp {
@@ -769,6 +1158,18 @@ mod tests {
         )
     }
 
+    fn recovery_files(path: &Path) -> Vec<PathBuf> {
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy();
+                name.contains(".tmp-") || name.contains(".backup-") || name.contains(".rollback-")
+            })
+            .collect()
+    }
+
     #[test]
     fn writes_exact_v2_keys_hashes_private_values_and_deduplicates() {
         let directory = tempfile::tempdir().unwrap();
@@ -816,6 +1217,73 @@ mod tests {
         assert_eq!(current.records[0].schema_version, SYNC_SCHEMA_VERSION);
         assert_eq!(current.records[0].event_id, "fresh");
         assert!(!fs::read_to_string(path).unwrap().contains("stale"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn replacement_race_preserves_both_the_original_and_competing_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/mac-a.jsonl");
+        let moved = path.with_extension("moved");
+        rewrite_local_ledger_v2(&path, [record("mac-a", "original", 1)]).unwrap();
+        let original = fs::read(&path).unwrap();
+        let replacement = sorted_v2_records([record("mac-a", "new", 2)]).unwrap();
+
+        let result = with_ledger_lock(&path, |boundary| {
+            let (existing, _) = local_ledger_state(&path)?;
+            rewrite_local_ledger_v2_unlocked_with(&path, &replacement, existing, boundary, || {
+                fs::rename(&path, &moved)?;
+                fs::write(&path, b"competing destination\n")?;
+                Ok(())
+            })
+        });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"competing destination\n");
+        assert_eq!(fs::read(&moved).unwrap(), original);
+        assert!(recovery_files(&path).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn successful_existing_rewrite_leaves_no_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/mac-a.jsonl");
+        rewrite_local_ledger_v2(&path, [record("mac-a", "original", 1)]).unwrap();
+
+        rewrite_local_ledger_v2(&path, [record("mac-a", "replacement", 2)]).unwrap();
+
+        assert_eq!(
+            read_ledger(&path, None).unwrap().records[0].event_id,
+            "replacement"
+        );
+        assert!(recovery_files(&path).is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_pre_swap_failure_keeps_destination_and_removes_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/mac-a.jsonl");
+        rewrite_local_ledger_v2(&path, [record("mac-a", "original", 1)]).unwrap();
+        let original = fs::read(&path).unwrap();
+        let replacement = sorted_v2_records([record("mac-a", "new", 2)]).unwrap();
+
+        let error = with_ledger_lock(&path, |boundary| {
+            let (existing, _) = local_ledger_state(&path)?;
+            rewrite_local_ledger_v2_unlocked_with(&path, &replacement, existing, boundary, || {
+                Err(map_race_safe_rename_error(io::Error::from_raw_os_error(libc::ENOTSUP)).into())
+            })
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("race-safe sync ledger replacement")
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(recovery_files(&path).is_empty());
     }
 
     #[test]

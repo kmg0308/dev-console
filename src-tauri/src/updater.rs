@@ -926,8 +926,12 @@ fn checked_windows_version_slice(
     Ok(unsafe { std::slice::from_raw_parts(value, byte_len) })
 }
 
-pub(crate) fn shutdown_runtime_atlas(_app: &AppHandle) {
-    let _ = shutdown_runtime_atlas_for_update(_app);
+pub(crate) fn shutdown_runtime_atlas(_app: &AppHandle) -> Result<(), String> {
+    #[cfg(feature = "runtime-atlas")]
+    if let Some(state) = _app.try_state::<crate::runtime_atlas::RuntimeAtlasState>() {
+        return state.shutdown_for_exit();
+    }
+    Ok(())
 }
 
 fn shutdown_runtime_atlas_for_update(_app: &AppHandle) -> Result<(), String> {

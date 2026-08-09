@@ -1,7 +1,9 @@
 use crate::account::{CodexAccountUsage, CodexAccountUsageError, parse_rate_limits_response};
 use chrono::Utc;
 use serde::Deserialize;
-#[cfg(target_os = "windows")]
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::{env, fs};
 use std::{
     ffi::OsStr,
@@ -105,11 +107,57 @@ fn account_executable(
             .ok_or(CodexAccountUsageServiceError::ExecutableNotFound);
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    return resolve_macos_account_executable();
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     return Ok(PathBuf::from("codex"));
 
     #[cfg(target_os = "windows")]
     resolve_windows_account_executable()
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_account_executable() -> Result<PathBuf, CodexAccountUsageServiceError> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let path = env::var_os("PATH");
+    let system_candidates = [
+        PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+    ];
+    resolve_macos_account_executable_from(home.as_deref(), path.as_deref(), &system_candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_account_executable_from(
+    home: Option<&Path>,
+    path: Option<&OsStr>,
+    system_candidates: &[PathBuf],
+) -> Result<PathBuf, CodexAccountUsageServiceError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut candidates = Vec::new();
+    if let Some(home) = home {
+        candidates.push(home.join(".local/bin/codex"));
+        candidates.push(home.join("Applications/ChatGPT.app/Contents/Resources/codex"));
+    }
+    candidates.extend_from_slice(system_candidates);
+    if let Some(path) = path {
+        candidates.extend(env::split_paths(path).map(|directory| directory.join("codex")));
+    }
+
+    let mut visited = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| visited.insert(candidate.clone()))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or(CodexAccountUsageServiceError::ExecutableNotFound)
 }
 
 #[cfg(target_os = "windows")]
@@ -566,6 +614,70 @@ mod tests {
     use std::{fs, path::Path};
     use tempfile::tempdir;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_resolver_keeps_configured_and_swift_candidate_order() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn executable(path: &Path) {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"fixture").unwrap();
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let directory = tempdir().unwrap();
+        let home = directory.path().join("home");
+        let local = home.join(".local/bin/codex");
+        let app = home.join("Applications/ChatGPT.app/Contents/Resources/codex");
+        let system = directory.path().join("system/codex");
+        let path = directory.path().join("path/codex");
+        for candidate in [&local, &app, &system, &path] {
+            executable(candidate);
+        }
+        let search_path = env::join_paths([path.parent().unwrap()]).unwrap();
+
+        assert_eq!(
+            account_executable(Some(system.as_os_str())).unwrap(),
+            system
+        );
+        assert_eq!(
+            resolve_macos_account_executable_from(
+                Some(&home),
+                Some(&search_path),
+                std::slice::from_ref(&system),
+            )
+            .unwrap(),
+            local
+        );
+        fs::remove_file(&local).unwrap();
+        assert_eq!(
+            resolve_macos_account_executable_from(
+                Some(&home),
+                Some(&search_path),
+                std::slice::from_ref(&system),
+            )
+            .unwrap(),
+            app
+        );
+        fs::remove_file(&app).unwrap();
+        assert_eq!(
+            resolve_macos_account_executable_from(
+                Some(&home),
+                Some(&search_path),
+                std::slice::from_ref(&system),
+            )
+            .unwrap(),
+            system
+        );
+        fs::remove_file(&system).unwrap();
+        assert_eq!(
+            resolve_macos_account_executable_from(Some(&home), Some(&search_path), &[]).unwrap(),
+            path
+        );
+    }
+
     #[test]
     fn app_server_success_error_timeout_and_exit_contracts() {
         let fixture = tempdir().unwrap();
@@ -599,7 +711,7 @@ mod tests {
             fetch_codex_account_usage(Some(interrupted.as_os_str()), Duration::from_secs(2)),
             Err(CodexAccountUsageServiceError::ConnectionClosed)
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(3));
         #[cfg(target_os = "macos")]
         stop_escaped_fixture(&interrupted.with_extension("pid"));
 

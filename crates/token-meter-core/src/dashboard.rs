@@ -100,6 +100,7 @@ pub struct DashboardFilterOptions {
 pub struct DashboardSettings {
     pub show_full_token_numbers: bool,
     pub sync_folder_path: Option<String>,
+    pub icloud_sync_folder_path: Option<String>,
     pub local_device_id: String,
     pub local_device_name: String,
     pub codex_home: Option<String>,
@@ -248,6 +249,7 @@ where
         settings: DashboardSettings {
             show_full_token_numbers: settings.show_full_token_numbers,
             sync_folder_path: settings.sync_folder_path.clone(),
+            icloud_sync_folder_path: None,
             local_device_id: settings.local_device_id.clone(),
             local_device_name: local_device_name.to_owned(),
             codex_home: settings.codex_home.clone(),
@@ -843,6 +845,7 @@ mod tests {
             settings: DashboardSettings {
                 show_full_token_numbers: false,
                 sync_folder_path: None,
+                icloud_sync_folder_path: Some("/iCloud Drive/TokenMeter".into()),
                 local_device_id: "local".into(),
                 local_device_name: "Mac".into(),
                 codex_home: None,
@@ -853,6 +856,10 @@ mod tests {
         };
         let json = serde_json::to_value(DashboardSnapshotDto::from(snapshot)).unwrap();
         assert_eq!(json["sessionCount"], usize::MAX);
+        assert_eq!(
+            json["settings"]["icloudSyncFolderPath"],
+            "/iCloud Drive/TokenMeter"
+        );
         for field in [
             "input",
             "cachedInput",

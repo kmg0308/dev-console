@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory = $true)][ValidateSet("true", "false")][string]$RuntimeFeature,
     [ValidateSet("x86_64-pc-windows-msvc")][string]$Target = "x86_64-pc-windows-msvc",
     [string]$CertificateThumbprint,
-    [string]$InstallerPath
+    [string]$InstallerPath,
+    [switch]$AllowWindowsServerSmoke
 )
 
 $ErrorActionPreference = "Stop"
@@ -71,11 +72,15 @@ $processArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArch
 if ($osVersion.Major -lt 10 -or ($osVersion.Major -eq 10 -and [int]$os.BuildNumber -lt 19045)) {
     throw "Windows build $($os.BuildNumber) is older than the Windows 10 22H2 support floor"
 }
+if ([int]$os.ProductType -ne 1 -and -not $AllowWindowsServerSmoke) {
+    throw "Windows release verification requires a client OS; use -AllowWindowsServerSmoke only for CI package smoke tests"
+}
 if ($osArchitecture -ne [Runtime.InteropServices.Architecture]::X64 -or
     $processArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
     throw "Windows QA requires an x64 OS and x64 process, found $osArchitecture/$processArchitecture"
 }
-Write-Host "Windows QA host: $($os.Caption), version $($os.Version), build $($os.BuildNumber), $osArchitecture OS/$processArchitecture process"
+$hostRole = if ([int]$os.ProductType -eq 1) { "client verification" } else { "explicit server smoke" }
+Write-Host "Windows QA host ($hostRole): $($os.Caption), version $($os.Version), build $($os.BuildNumber), $osArchitecture OS/$processArchitecture process"
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $release = Join-Path $root "target/$Target/release"

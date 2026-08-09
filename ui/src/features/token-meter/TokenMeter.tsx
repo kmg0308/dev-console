@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { pickDirectory } from "../../folder-dialog";
 import "./token-meter.css";
 
 type TokenSource = "all" | "codex" | "claude";
@@ -93,6 +94,7 @@ export type DashboardSnapshot = {
   settings: {
     showFullTokenNumbers: boolean;
     syncFolderPath?: string;
+    icloudSyncFolderPath?: string;
     localDeviceId: string;
     localDeviceName: string;
     codexHome?: string;
@@ -324,16 +326,27 @@ export function TokenMeter() {
     }
   }
 
-  async function saveSyncFolder(path: string | null) {
+  async function saveSyncFolder(path: string | null, confirmChange = true) {
     const description = path ? `Use this sync folder?\n\n${path}` : "Turn off sync and clear the configured folder?";
-    if (!window.confirm(description)) return;
+    if (confirmChange && !window.confirm(description)) return;
     setAction({ kind: "working", scope: "sync", message: "Updating sync folder…" });
     try {
-      await invoke<DashboardSnapshot["settings"]>("token_meter_set_sync_folder", { path });
-      setSyncPath(path ?? "");
+      const settings = await invoke<DashboardSnapshot["settings"]>("token_meter_set_sync_folder", { path });
+      setSyncPath(settings.syncFolderPath ?? "");
       syncPathDirty.current = false;
       setAction({ kind: "success", scope: "sync", message: path ? "Sync folder updated." : "Sync turned off." });
       setReload((value) => value + 1);
+    } catch (reason) {
+      setAction({ kind: "error", scope: "sync", message: errorMessage(reason) });
+    }
+  }
+
+  async function chooseSyncFolder() {
+    try {
+      const path = await pickDirectory();
+      if (!path) return;
+      setSyncPath(path);
+      syncPathDirty.current = true;
     } catch (reason) {
       setAction({ kind: "error", scope: "sync", message: errorMessage(reason) });
     }
@@ -417,7 +430,7 @@ export function TokenMeter() {
                   const segments = segmentsFor(item, source);
                   const label = `${formatDate(item.start, true)}, ${formatTokens(item.usage.total, exact)} tokens${segments.map((segment) => `, ${segment.label} ${formatTokens(segment.value, exact)}`).join("")}`;
                   return (
-                    <button className={`tm-chart-bar${activeBucket === index ? " active" : ""}`} type="button" aria-label={label} key={`${String(item.start)}-${index}`} onFocus={() => setActiveBucket(index)} onPointerEnter={() => setActiveBucket(index)} onKeyDown={(event) => moveChartFocus(event, index)}>
+                    <button className={`tm-chart-bar${activeBucket === index ? " active" : ""}`} type="button" aria-label={label} tabIndex={activeBucket === index ? 0 : -1} key={`${String(item.start)}-${index}`} onFocus={() => setActiveBucket(index)} onPointerEnter={() => setActiveBucket(index)} onKeyDown={(event) => moveChartFocus(event, index)}>
                       <span className="tm-bar-stack" style={{ height: `${Math.max(2, tokenNumber(item.usage.total) / chartMaximum * 100)}%` }} aria-hidden="true">
                         {segments.map((segment) => <i className={segment.className} style={{ flexGrow: tokenNumber(segment.value) }} key={segment.label} />)}
                       </span>
@@ -463,7 +476,7 @@ export function TokenMeter() {
         <div className="tm-card tm-status-list">
           {snapshot.sourceStatuses.length === 0 ? <p className="tm-empty">Source status is not available.</p> : snapshot.sourceStatuses.map((status) => <SourceStatus status={status} key={`${status.source}-${status.path}`} />)}
           <form className="tm-source-settings" onSubmit={(event) => { event.preventDefault(); void saveSourcePaths(); }}>
-            <p>Blank source paths use a verified platform default when one exists. A blank Codex executable uses the exact <code>codex</code> command available in the packaged app's PATH.</p>
+            <p>Blank paths use verified platform defaults when available. Set an absolute Codex executable path only to override the platform lookup.</p>
             <label>Codex home<input type="text" value={sourcePaths.codexHome} placeholder="Absolute path to the Codex data folder" spellCheck={false} onChange={(event) => { sourcePathsDirty.current = true; setSourcePaths((paths) => ({ ...paths, codexHome: event.target.value })); }} /></label>
             <label>Claude projects<input type="text" value={sourcePaths.claudeProjectsPath} placeholder="Absolute path to the Claude projects folder" spellCheck={false} onChange={(event) => { sourcePathsDirty.current = true; setSourcePaths((paths) => ({ ...paths, claudeProjectsPath: event.target.value })); }} /></label>
             <label>Hermes database<input type="text" value={sourcePaths.hermesDatabasePath} placeholder="Absolute path to the Hermes state database" spellCheck={false} onChange={(event) => { sourcePathsDirty.current = true; setSourcePaths((paths) => ({ ...paths, hermesDatabasePath: event.target.value })); }} /></label>
@@ -484,7 +497,7 @@ export function TokenMeter() {
         <div className="tm-card tm-sync">
           <SyncSummary status={snapshot.syncStatus} />
           <label>Folder path<input type="text" value={syncPath} placeholder="Enter an absolute folder path" onChange={(event) => { setSyncPath(event.target.value); syncPathDirty.current = true; }} /></label>
-          <div className="tm-actions"><button className="tm-button tm-primary" type="button" disabled={!syncPath.trim() || action.kind === "working"} onClick={() => saveSyncFolder(syncPath.trim())}>Use Folder</button>{snapshot.settings.syncFolderPath && <button className="tm-button" type="button" disabled={action.kind === "working"} onClick={() => saveSyncFolder(null)}>Turn Off</button>}</div>
+          <div className="tm-actions">{snapshot.settings.icloudSyncFolderPath && <button className="tm-button" type="button" disabled={action.kind === "working"} onClick={() => saveSyncFolder(snapshot.settings.icloudSyncFolderPath!, false)}>Use iCloud Drive</button>}<button className="tm-button" type="button" disabled={action.kind === "working"} onClick={() => void chooseSyncFolder()}>Choose Folder…</button><button className="tm-button tm-primary" type="button" disabled={!syncPath.trim() || action.kind === "working"} onClick={() => saveSyncFolder(syncPath.trim())}>Use Folder</button>{snapshot.settings.syncFolderPath && <button className="tm-button" type="button" disabled={action.kind === "working"} onClick={() => saveSyncFolder(null)}>Turn Off</button>}</div>
         </div>
         {action.scope === "sync" && <div className={`tm-notice${action.kind === "error" ? " tm-error" : ""}`} role={action.kind === "error" ? "alert" : "status"}>{action.message}</div>}
       </section>
@@ -518,7 +531,7 @@ function CodexLimits({ account }: { account?: CodexAccount | null }) {
 }
 
 function SourceStatus({ status }: { status: DataSourceStatus }) {
-  return <div className="tm-status-row"><span className={`tm-status-icon ${status.exists && status.parseErrorCount === 0 ? "ok" : "warn"}`} aria-hidden="true">{status.exists && status.parseErrorCount === 0 ? "●" : "▲"}</span><div><strong><i className={`tm-dot tm-${status.source}`} />{status.label}</strong><small title={status.path}>{status.path}</small></div><dl><div><dt>Scanned</dt><dd>{integer.format(status.scannedFileCount)}</dd></div><div><dt>Total</dt><dd>{integer.format(status.totalFileCount)}</dd></div>{status.parseErrorCount > 0 && <div><dt>Errors</dt><dd className="tm-warning">{integer.format(status.parseErrorCount)}</dd></div>}</dl></div>;
+  return <div className="tm-status-row"><span className={`tm-status-icon ${status.exists && status.parseErrorCount === 0 ? "ok" : "warn"}`} aria-hidden="true">{status.exists && status.parseErrorCount === 0 ? "●" : "▲"}</span><div><strong><i className={`tm-dot tm-${status.source}`} />{status.label}</strong><small>{status.exists ? "Available" : "Missing"}</small><small title={status.path}>{status.path}</small></div><dl><div><dt>Scanned</dt><dd>{integer.format(status.scannedFileCount)}</dd></div><div><dt>Total</dt><dd>{integer.format(status.totalFileCount)}</dd></div>{status.parseErrorCount > 0 && <div><dt>Errors</dt><dd className="tm-warning">{integer.format(status.parseErrorCount)}</dd></div>}</dl></div>;
 }
 
 function SyncSummary({ status }: { status: SyncStatus }) {

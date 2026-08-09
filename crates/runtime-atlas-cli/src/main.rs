@@ -1,7 +1,10 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use runtime_atlas_core::models::{AppLanguage, CustomActionDefinition};
+use runtime_atlas_core::models::{
+    AppLanguage, AtlasNotice, CustomActionDefinition, DiscoveryAvailability, RepositoryStatus,
+    RuntimeContainer, RuntimeProcess,
+};
 use runtime_atlas_core::observe::{observe_docker, observe_processes, resolve_docker_executable};
 use runtime_atlas_core::relations::PathFlavor;
 use runtime_atlas_core::service::{
@@ -68,7 +71,7 @@ fn status(
             observe_processes(),
             observe_docker(resolve_docker_executable().as_deref()),
         )?;
-        write_json(stdout, &snapshot)
+        write_json(stdout, &PublicStatus::from(snapshot))
     })();
     match result {
         Ok(()) => 0,
@@ -249,6 +252,142 @@ struct ActionCatalog {
     actions: Vec<CustomActionDefinition>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicStatus {
+    schema_version: u32,
+    #[serde(serialize_with = "serialize_iso8601_seconds")]
+    generated_at: chrono::DateTime<chrono::Utc>,
+    process_discovery: DiscoveryAvailability,
+    docker_discovery: DiscoveryAvailability,
+    notices: Vec<AtlasNotice>,
+    repositories: Vec<PublicRepositoryStatus>,
+}
+
+fn serialize_iso8601_seconds<S>(
+    value: &chrono::DateTime<chrono::Utc>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicRepositoryStatus {
+    id: uuid::Uuid,
+    path: String,
+    name: String,
+    availability: runtime_atlas_core::models::AvailabilityState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<String>,
+    worktrees: Vec<PublicWorktreeStatus>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicWorktreeStatus {
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    detached: bool,
+    sha: String,
+    #[serde(rename = "shortSHA")]
+    short_sha: String,
+    dirty: bool,
+    availability: runtime_atlas_core::models::AvailabilityState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable_reason: Option<String>,
+    processes: Vec<RuntimeProcess>,
+    containers: Vec<RuntimeContainer>,
+}
+
+impl From<RuntimeAtlasSnapshot> for PublicStatus {
+    fn from(snapshot: RuntimeAtlasSnapshot) -> Self {
+        let repositories = snapshot
+            .repositories
+            .iter()
+            .map(|repository| PublicRepositoryStatus::from_snapshot(repository, &snapshot))
+            .collect();
+        Self {
+            schema_version: 1,
+            generated_at: snapshot.generated_at,
+            process_discovery: snapshot.process_discovery,
+            docker_discovery: snapshot.docker_discovery,
+            notices: snapshot.notices,
+            repositories,
+        }
+    }
+}
+
+impl PublicRepositoryStatus {
+    fn from_snapshot(repository: &RepositoryStatus, snapshot: &RuntimeAtlasSnapshot) -> Self {
+        Self {
+            id: repository.id,
+            path: repository.path.clone(),
+            name: repository.name.clone(),
+            availability: repository.availability,
+            unavailable_reason: repository.unavailable_reason.clone(),
+            worktrees: repository
+                .worktrees
+                .iter()
+                .map(|worktree| {
+                    let mut processes = snapshot
+                        .relations
+                        .iter()
+                        .filter(|relation| {
+                            relation.worktree_path.as_deref() == Some(&worktree.path)
+                        })
+                        .filter_map(|relation| {
+                            snapshot
+                                .processes
+                                .iter()
+                                .find(|process| process.identity == relation.process_identity)
+                        })
+                        .map(|process| RuntimeProcess {
+                            pid: process.identity.pid,
+                            name: process.name.clone(),
+                            cwd: process.cwd.clone(),
+                            ports: process.ports.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    processes.sort_by(|left, right| {
+                        left.name.cmp(&right.name).then(left.pid.cmp(&right.pid))
+                    });
+                    let mut containers = snapshot
+                        .containers
+                        .iter()
+                        .filter(|container| {
+                            container
+                                .worktree_links
+                                .iter()
+                                .any(|link| link.worktree_path == worktree.path)
+                        })
+                        .map(|container| container.container.clone())
+                        .collect::<Vec<_>>();
+                    containers.sort_by(|left, right| {
+                        left.name.cmp(&right.name).then(left.id.cmp(&right.id))
+                    });
+                    PublicWorktreeStatus {
+                        path: worktree.path.clone(),
+                        branch: worktree.branch.clone(),
+                        detached: worktree.detached,
+                        sha: worktree.sha.clone(),
+                        short_sha: worktree.short_sha.clone(),
+                        dirty: worktree.dirty,
+                        availability: worktree.availability,
+                        unavailable_reason: worktree.unavailable_reason.clone(),
+                        processes,
+                        containers,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
@@ -261,7 +400,6 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use runtime_atlas_core::STATUS_SCHEMA_VERSION;
     #[cfg(target_os = "macos")]
     use runtime_atlas_core::models::{
         AvailabilityState, CustomActionKind, CustomActionRisk, CustomActionWorkingDirectory,
@@ -319,8 +457,45 @@ mod tests {
         let (exit, output, error) = invoke(&["status", "--json"], directory.path());
         assert_eq!((exit, error.as_str()), (0, ""));
         let status: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(status["schemaVersion"], STATUS_SCHEMA_VERSION);
-        assert!(status["repositories"].is_array());
+        assert_eq!(status["schemaVersion"], 1);
+        let mut keys = status
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "dockerDiscovery",
+                "generatedAt",
+                "notices",
+                "processDiscovery",
+                "repositories",
+                "schemaVersion",
+            ]
+        );
+    }
+
+    #[test]
+    fn public_status_uses_seconds_only_iso8601_wire_time() {
+        let generated_at = chrono::DateTime::parse_from_rfc3339("2026-08-10T01:02:03.456789Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let status = PublicStatus {
+            schema_version: 1,
+            generated_at,
+            process_discovery: runtime_atlas_core::models::DiscoveryAvailability::available(),
+            docker_discovery: runtime_atlas_core::models::DiscoveryAvailability::available(),
+            notices: Vec::new(),
+            repositories: Vec::new(),
+        };
+
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["generatedAt"],
+            "2026-08-10T01:02:03Z"
+        );
     }
 
     #[test]
@@ -459,6 +634,13 @@ mod tests {
             docker(),
         )
         .unwrap();
+        let public = serde_json::to_value(PublicStatus::from(snapshot.clone())).unwrap();
+        let worktree = &public["repositories"][0]["worktrees"][0];
+        assert_eq!(worktree["processes"][0]["name"], "listener");
+        assert!(worktree.get("relations").is_none());
+        assert!(public.get("language").is_none());
+        assert!(public.get("actions").is_none());
+        assert!(public.get("actionRuns").is_none());
         assert_eq!(snapshot.action_runs.len(), 1);
         assert_eq!(
             snapshot.action_runs[0].phase,

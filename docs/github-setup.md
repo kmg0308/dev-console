@@ -5,7 +5,7 @@
 `.github/workflows/verify.yml`은 pull request와 `main` push에서 다음을 수행합니다.
 
 - macOS 14와 Windows Server 2022에서 TypeScript build, Rust format·clippy·test
-- macOS universal `app,dmg`와 Windows x64 NSIS를 세 flavor별 unsigned build
+- 세 flavor의 macOS universal DMG를 임시 설치·기동하고, Windows Server 2022에서 x64 NSIS 설치·기동·제거 smoke를 수행
 
 macOS 14 runner 결과는 macOS 13 실제 동작 증거가 아니며, Windows runner 결과도 Windows용 compile·test·package 증거일 뿐 Windows 10 22H2 실제 동작 증거가 아닙니다. 저장소 보호 규칙은 모든 검사와 bundle job이 성공할 때만 통과하는 aggregate `verify`를 요구하고 Actions 권한은 read-only로 유지합니다. 이 저장소에는 자동 push, dependency PR, release workflow가 없습니다.
 

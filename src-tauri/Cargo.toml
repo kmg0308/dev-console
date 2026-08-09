@@ -13,6 +13,7 @@ runtime-atlas-core = { path = "../crates/runtime-atlas-core", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tauri-plugin-updater.workspace = true
 token-meter-core = { path = "../crates/token-meter-core", optional = true }
 sys-locale = { workspace = true, optional = true }

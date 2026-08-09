@@ -100,6 +100,7 @@ if (Test-Path -LiteralPath $installerStatePath) {
 $os = Get-CimInstance Win32_OperatingSystem
 $hostInfo = [PSCustomObject]@{
   build = [int]$os.BuildNumber
+  productType = [int]$os.ProductType
   osArchitecture = [string][Runtime.InteropServices.RuntimeInformation]::OSArchitecture
   processArchitecture = [string][Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture
   localAppData = $localAppData
@@ -186,6 +187,7 @@ function assertWindowsHost(host) {
   if (
     !Number.isInteger(host?.build) ||
     host.build < 19045 ||
+    host.productType !== 1 ||
     host.osArchitecture !== "X64" ||
     host.processArchitecture !== "X64" ||
     typeof host.localAppData !== "string" ||
@@ -536,6 +538,7 @@ async function selfTest() {
   assertProductionAbsent({ installs: [], processes: [], appData: [], installerState: null });
   assertWindowsHost({
     build: 19045,
+    productType: 1,
     osArchitecture: "X64",
     processArchitecture: "X64",
     localAppData: tmpdir(),
@@ -543,6 +546,17 @@ async function selfTest() {
   assert.throws(
     () => assertWindowsHost({
       build: 19044,
+      productType: 1,
+      osArchitecture: "X64",
+      processArchitecture: "X64",
+      localAppData: tmpdir(),
+    }),
+    /Windows 10 22H2/,
+  );
+  assert.throws(
+    () => assertWindowsHost({
+      build: 20348,
+      productType: 3,
       osArchitecture: "X64",
       processArchitecture: "X64",
       localAppData: tmpdir(),

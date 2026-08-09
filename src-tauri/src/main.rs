@@ -11,6 +11,7 @@ use std::path::{Component, PathBuf};
 use serde::Serialize;
 #[cfg(any(feature = "runtime-atlas", feature = "token-meter"))]
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 #[cfg(feature = "runtime-atlas")]
 mod runtime_atlas;
@@ -193,7 +194,7 @@ fn main() {
         println!("{identifier}\n{}", data_directory.display());
         return;
     }
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     let builder = if updater::updater_configured(context.config().plugins.0.get("updater")) {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     } else {
@@ -266,8 +267,18 @@ fn main() {
         .build(context)
         .expect("desktop host could not be built");
     app.run(|app, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
-            updater::shutdown_runtime_atlas(app);
+        if let tauri::RunEvent::ExitRequested { api, .. } = event
+            && let Err(error) = updater::shutdown_runtime_atlas(app)
+        {
+            eprintln!("Runtime Atlas shutdown blocked application exit: {error}");
+            api.prevent_exit();
+            app.dialog()
+                .message(format!(
+                    "Runtime Atlas could not close safely. Resolve the managed action state and try again.\n\n{error}"
+                ))
+                .title("Runtime Atlas")
+                .kind(MessageDialogKind::Error)
+                .show(|_| {});
         }
     });
 }

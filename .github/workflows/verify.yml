@@ -24,7 +24,7 @@ jobs:
           - name: macOS
             os: macos-14
           # This validates a Windows Server runner, not Windows 10 22H2 runtime behavior.
-          - name: Windows package runner
+          - name: Windows Server 2022 compile checks
             os: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -74,7 +74,7 @@ jobs:
             bundles: app,dmg
           # This validates an x64 NSIS package on Windows Server, not Windows 10 22H2.
           - platform: windows
-            name: Windows x64 package runner
+            name: Windows Server 2022 x64 package smoke
             os: windows-2022
             target: x86_64-pc-windows-msvc
             bundles: nsis
@@ -93,10 +93,20 @@ jobs:
       - run: npm ci
       - name: Build unsigned bundle
         run: npm run tauri -- build --ci --no-sign --config apps/${{ matrix.app.id }}/tauri.conf.json --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Verify macOS DMG install and startup
+        if: matrix.platform == 'macos'
+        run: >-
+          bash scripts/verify-macos-bundle.sh
+          target/${{ matrix.target }}/release/bundle/dmg/${{ matrix.app.product }}_${{ matrix.app.version }}_universal.dmg
+          '${{ matrix.app.product }}'
+          '${{ matrix.app.binary }}'
+          '${{ matrix.app.identifier }}'
+          '${{ matrix.app.version }}'
+          '${{ matrix.app.runtime }}'
       - name: Test RuntimeAtlas macOS package contract
         if: matrix.app.id == 'runtime-atlas' && matrix.platform == 'macos'
         run: npm run test:runtime-atlas:macos-package -- target/${{ matrix.target }}/release/bundle/macos/RuntimeAtlas.app
-      - name: Verify Windows bundle and startup
+      - name: Smoke Windows bundle and startup on Server 2022
         if: runner.os == 'Windows'
         shell: pwsh
         run: >-
@@ -106,6 +116,7 @@ jobs:
           -BundleIdentifier '${{ matrix.app.identifier }}'
           -Version '${{ matrix.app.version }}'
           -RuntimeFeature '${{ matrix.app.runtime }}'
+          -AllowWindowsServerSmoke
 
   verify:
     if: ${{ always() }}

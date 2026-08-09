@@ -86,8 +86,25 @@ impl<'a> HermesScanner<'a> {
         observed_at: DateTime<Utc>,
         is_cancelled: impl Fn() -> bool,
     ) -> HermesScanOutcome {
-        if !self.database_path.is_file() {
-            return HermesScanOutcome::default();
+        let metadata = match std::fs::metadata(&self.database_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return HermesScanOutcome::default();
+            }
+            Err(_) => {
+                return HermesScanOutcome {
+                    database_exists: true,
+                    parse_error_count: 1,
+                    ..HermesScanOutcome::default()
+                };
+            }
+            Ok(metadata) => metadata,
+        };
+        if !metadata.is_file() {
+            return HermesScanOutcome {
+                database_exists: true,
+                parse_error_count: 1,
+                ..HermesScanOutcome::default()
+            };
         }
         if is_cancelled() {
             return HermesScanOutcome {
@@ -465,6 +482,27 @@ mod tests {
             )
             .unwrap();
         connection
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_metadata_failure_is_reported_as_incomplete() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let database_path = directory.path().join("loop.db");
+        symlink(&database_path, &database_path).unwrap();
+        let scanner = HermesScanner::new(
+            &database_path,
+            TokenDeviceMetadata::new("device-a", "Device A"),
+            None,
+        );
+
+        let outcome = scanner.scan(|| false);
+
+        assert!(outcome.database_exists);
+        assert_eq!(outcome.parse_error_count, 1);
+        assert!(outcome.events.is_empty());
     }
 
     #[test]
