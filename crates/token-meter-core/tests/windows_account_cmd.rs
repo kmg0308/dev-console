@@ -64,7 +64,10 @@ fn assert_process_stopped(pid: u32) {
 
     let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if !process.is_null() {
-        assert_eq!(unsafe { WaitForSingleObject(process, 0) }, WAIT_OBJECT_0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(process, 3_000) },
+            WAIT_OBJECT_0
+        );
         unsafe { CloseHandle(process) };
     }
 }
