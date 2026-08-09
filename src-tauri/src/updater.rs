@@ -744,12 +744,11 @@ fn windows_artifact_metadata(bytes: &[u8]) -> Result<ArtifactMetadata, String> {
             if !entry.is_dir()
                 && path.components().count() == 1
                 && path.extension().is_some_and(|extension| extension == "exe")
+                && installer.replace(index).is_some()
             {
-                if installer.replace(index).is_some() {
-                    return Err(
-                        "Downloaded Windows update ZIP contains multiple NSIS installers".into(),
-                    );
-                }
+                return Err(
+                    "Downloaded Windows update ZIP contains multiple NSIS installers".into(),
+                );
             }
         }
         let index = installer
@@ -821,14 +820,13 @@ fn windows_version_string(info: &[u8], translations: &[u8], field: &str) -> Resu
         let language = u16::from_le_bytes([translation[0], translation[1]]);
         let code_page = u16::from_le_bytes([translation[2], translation[3]]);
         let query = format!(r"\StringFileInfo\{language:04x}{code_page:04x}\{field}");
-        let Ok((value, characters)) = (unsafe { query_windows_version_value(&info, &query) })
-        else {
+        let Ok((value, characters)) = (unsafe { query_windows_version_value(info, &query) }) else {
             continue;
         };
         let byte_len = (characters as usize)
             .checked_mul(2)
             .ok_or_else(|| "Downloaded Windows update version is too large".to_owned())?;
-        let value = checked_windows_version_slice(&info, value, byte_len)?;
+        let value = checked_windows_version_slice(info, value, byte_len)?;
         let mut utf16 = value
             .chunks_exact(2)
             .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
@@ -881,11 +879,11 @@ unsafe fn query_windows_version_value(
 }
 
 #[cfg(windows)]
-fn checked_windows_version_slice<'a>(
-    info: &'a [u8],
+fn checked_windows_version_slice(
+    info: &[u8],
     value: *const u8,
     byte_len: usize,
-) -> Result<&'a [u8], String> {
+) -> Result<&[u8], String> {
     let start = info.as_ptr() as usize;
     let end = start
         .checked_add(info.len())

@@ -372,30 +372,12 @@ impl TokenMeterState {
                 .claude_projects_path
                 .as_ref()
                 .map(PathBuf::from)
-                .or_else(|| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        Some(self.home_dir.join(".claude/projects"))
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        None
-                    }
-                }),
+                .or_else(|| self.default_source_path(".claude/projects")),
             hermes_database: settings
                 .hermes_database_path
                 .as_ref()
                 .map(PathBuf::from)
-                .or_else(|| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        Some(self.home_dir.join(".hermes/state.db"))
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        None
-                    }
-                }),
+                .or_else(|| self.default_source_path(".hermes/state.db")),
         }
     }
 
@@ -408,16 +390,19 @@ impl TokenMeterState {
             .as_ref()
             .map(PathBuf::from)
             .or_else(|| self.codex_home_env.clone())
-            .or_else(|| {
-                #[cfg(target_os = "macos")]
-                {
-                    Some(self.home_dir.join(".codex"))
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    None
-                }
-            })
+            .or_else(|| self.default_source_path(".codex"))
+    }
+
+    fn default_source_path(&self, relative: &str) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            Some(self.home_dir.join(relative))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = relative;
+            None
+        }
     }
 
     fn cleanup_preview(&self, retention_days: u32) -> Result<CleanupPreviewResult, String> {
