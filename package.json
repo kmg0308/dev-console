@@ -1,0 +1,40 @@
+{
+  "name": "dev-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc --noEmit && vite build",
+    "check": "npm run build && npm run test:release",
+    "sidecars": "node scripts/prepare-sidecars.mjs",
+    "build:runtime": "npm run build && npm run sidecars",
+    "package:runtime-atlas:macos": "bash scripts/package-runtime-atlas-macos.sh",
+    "test:runtime-atlas:macos-package": "bash scripts/test-runtime-atlas-macos-package.sh",
+    "verify:runtime-atlas:macos-package": "bash scripts/verify-runtime-atlas-macos-package.sh",
+    "qa:updater:macos": "node scripts/prepare-updater-macos-qa.mjs",
+    "release": "node scripts/build-release.mjs",
+    "test:release": "node scripts/build-release.mjs --self-test",
+    "dev:runtime": "npm run sidecars && npm run dev",
+    "tauri": "tauri",
+    "tauri:dev:token-meter": "tauri dev --config apps/token-meter/tauri.conf.json",
+    "tauri:dev:runtime-atlas": "tauri dev --config apps/runtime-atlas/tauri.conf.json",
+    "tauri:dev:dev-console": "tauri dev --config apps/dev-console/tauri.conf.json",
+    "tauri:build:token-meter": "tauri build --config apps/token-meter/tauri.conf.json",
+    "tauri:build:runtime-atlas": "tauri build --config apps/runtime-atlas/tauri.conf.json",
+    "tauri:build:dev-console": "tauri build --config apps/dev-console/tauri.conf.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1"
+  }
+}

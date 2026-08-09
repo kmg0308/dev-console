@@ -1,0 +1,45 @@
+[package]
+name = "dev-console-desktop"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+chrono = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+runtime-atlas-core = { path = "../crates/runtime-atlas-core", optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-updater.workspace = true
+token-meter-core = { path = "../crates/token-meter-core", optional = true }
+sys-locale = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+flate2 = "1"
+plist.workspace = true
+tar = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+infer = "0.19"
+tempfile.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_System_SystemInformation",
+] }
+zip = { version = "4", default-features = false }
+
+[features]
+default = []
+runtime-atlas = ["dep:chrono", "dep:libc", "dep:runtime-atlas-core", "dep:sys-locale", "dep:uuid"]
+token-meter = ["dep:chrono", "dep:token-meter-core", "dep:uuid"]

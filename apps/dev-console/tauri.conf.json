@@ -1,0 +1,29 @@
+{
+  "productName": "DevConsole",
+  "mainBinaryName": "DevConsole",
+  "identifier": "com.kmg0308.devconsole",
+  "build": {
+    "features": ["runtime-atlas", "token-meter"],
+    "beforeBuildCommand": "npm run build:runtime",
+    "beforeDevCommand": "npm run dev:runtime"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "DevConsole",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 800,
+        "minHeight": 620,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "externalBin": [
+      "binaries/runtime-atlas-supervisor",
+      "binaries/runtime-atlas"
+    ]
+  }
+}

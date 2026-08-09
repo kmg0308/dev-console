@@ -1,13 +1,104 @@
-name: Verify
+name: Desktop checks and unsigned bundles
+
 on:
   pull_request:
   push:
     branches: [main]
+
 permissions:
   contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  verify:
-    runs-on: macos-26
+  checks:
+    name: Checks (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-14
+          # This validates a Windows Server runner, not Windows 10 22H2 runtime behavior.
+          - name: Windows package runner
+            os: windows-2022
     steps:
-      - uses: actions/checkout@v6
-      - run: ./scripts/verify.sh
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --all-features --locked
+
+  bundles:
+    name: ${{ matrix.app.id }} (${{ matrix.name }})
+    needs: checks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - id: token-meter
+            product: TokenMeter
+            binary: TokenMeter
+            version: 0.1.0
+            runtime: false
+          - id: runtime-atlas
+            product: RuntimeAtlas
+            binary: RuntimeAtlas
+            version: 0.1.0
+            runtime: true
+          - id: dev-console
+            product: DevConsole
+            binary: DevConsole
+            version: 0.1.0
+            runtime: true
+        platform: [macos, windows]
+        include:
+          - platform: macos
+            name: macOS universal
+            os: macos-14
+            target: universal-apple-darwin
+            bundles: app,dmg
+          # This validates an x64 NSIS package on Windows Server, not Windows 10 22H2.
+          - platform: windows
+            name: Windows x64 package runner
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install macOS Rust targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Install Windows Rust target
+        if: runner.os == 'Windows'
+        run: rustup target add x86_64-pc-windows-msvc
+      - run: npm ci
+      - name: Build unsigned bundle
+        run: npm run tauri -- build --ci --no-sign --config apps/${{ matrix.app.id }}/tauri.conf.json --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Test RuntimeAtlas macOS package contract
+        if: matrix.app.id == 'runtime-atlas' && matrix.platform == 'macos'
+        run: npm run test:runtime-atlas:macos-package -- target/${{ matrix.target }}/release/bundle/macos/RuntimeAtlas.app
+      - name: Verify Windows bundle and startup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          ./scripts/verify-windows-bundle.ps1
+          -ProductName '${{ matrix.app.product }}'
+          -MainBinaryName '${{ matrix.app.binary }}'
+          -Version '${{ matrix.app.version }}'
+          -RuntimeFeature '${{ matrix.app.runtime }}'

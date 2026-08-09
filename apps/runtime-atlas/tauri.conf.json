@@ -1,0 +1,39 @@
+{
+  "productName": "RuntimeAtlas",
+  "mainBinaryName": "RuntimeAtlas",
+  "identifier": "com.kmg0308.runtimeatlas",
+  "build": {
+    "features": ["runtime-atlas"],
+    "beforeBuildCommand": "npm run build:runtime",
+    "beforeDevCommand": "npm run dev:runtime"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Runtime Atlas",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 640,
+        "minHeight": 720,
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "externalBin": [
+      "binaries/runtime-atlas-supervisor",
+      "binaries/runtime-atlas"
+    ],
+    "icon": [
+      "icons/runtime-atlas-32x32.png",
+      "icons/runtime-atlas-128x128.png",
+      "icons/runtime-atlas-128x128@2x.png",
+      "icons/runtime-atlas.icns",
+      "icons/runtime-atlas.ico"
+    ],
+    "macOS": {
+      "infoPlist": "../apps/runtime-atlas/Info.plist"
+    }
+  }
+}

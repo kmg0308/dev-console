@@ -1,17 +1,70 @@
 # DevConsole
 
-Runtime Atlas와 TokenMeter를 한 macOS 앱의 탭으로 제공하는 통합 shell입니다. 두 프로젝트의 코드와 독립 앱 릴리스는 각각 원본 저장소에 남습니다.
+TokenMeter, Runtime Atlas, DevConsole의 canonical monorepo입니다. 세 앱은 하나의 Rust core, React UI, Tauri host를 조합하는 얇은 flavor입니다.
 
-[DevConsole.pkg 다운로드](https://github.com/kmg0308/dev-console/releases/latest/download/DevConsole.pkg)
+| flavor | 기능 | 추가 산출물 |
+| --- | --- | --- |
+| `token-meter` | TokenMeter | 없음 |
+| `runtime-atlas` | Runtime Atlas | `runtime-atlas`, `runtime-atlas-supervisor` sidecar |
+| `dev-console` | 두 기능 | Runtime Atlas sidecar 두 개 |
 
-`Control+Tab`과 `Control+Shift+Tab`은 두 탭을 전환합니다. Runtime Atlas 탭의 `Control+Q+Tab`과 역방향 조합은 worktree를 전환합니다. DevConsole과 독립 RuntimeAtlas.app은 동시에 Runtime Atlas 세션을 소유하지 못합니다.
+도메인 코드는 `crates/`, 공용 UI는 `ui/`, 창·IPC·bundle 경계는 `src-tauri/`, flavor 설정은 `apps/`에 있습니다. 지원 기준은 macOS 13 이상과 Windows 10 22H2 이상 x64입니다.
 
-두 feature는 원본 저장소의 revision을 `Package.swift`와 `Package.resolved`에 고정해 사용합니다. Runtime Atlas는 기존 Application Support 데이터를, TokenMeter는 기존 `local.tokenmeter.app` preference와 로컬 데이터를 그대로 사용하며 복제나 마이그레이션을 하지 않습니다.
+## 개발과 검증
 
-## Build
+Node.js 24와 `rustup`을 준비합니다. Rust 버전은 `rust-toolchain.toml`에 고정되어 있습니다.
 
-`./scripts/verify.sh`는 앱, helper, ZIP, PKG, updater와 workflow 계약을 검증합니다. `VERSION=0.1.0 ./scripts/package.sh`는 `dist`에 `DevConsole.app`, 고정·버전 ZIP/PKG와 manifest를 만듭니다.
+```sh
+npm ci
+npm run check
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+```
 
-업데이트는 시작 시와 6시간마다 확인하며, 새 버전이 있으면 상단에 설치 버튼을 표시합니다. `kmg0308/dev-console`의 `DevConsole.zip`만 허용하고 embedded feature는 이 서비스를 사용하지 않습니다.
+앱을 개발 모드로 실행합니다.
 
-컴포넌트 릴리스는 검증된 dependency-update PR을 만들고, DevConsole `main`은 전체 검증 후 앱을 릴리스합니다. 필요한 저장소 설정과 최소 권한은 `docs/github-setup.md`에 있습니다.
+```sh
+npm run tauri:dev:token-meter
+npm run tauri:dev:runtime-atlas
+npm run tauri:dev:dev-console
+```
+
+macOS universal unsigned bundle을 만듭니다.
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+npm run tauri:build:token-meter -- --ci --no-sign --target universal-apple-darwin --bundles app,dmg
+npm run tauri:build:runtime-atlas -- --ci --no-sign --target universal-apple-darwin --bundles app,dmg
+npm run tauri:build:dev-console -- --ci --no-sign --target universal-apple-darwin --bundles app,dmg
+```
+
+Windows x64 unsigned installer는 Windows 호스트에서 만듭니다.
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+npm run tauri:build:token-meter -- --ci --no-sign --target x86_64-pc-windows-msvc --bundles nsis
+npm run tauri:build:runtime-atlas -- --ci --no-sign --target x86_64-pc-windows-msvc --bundles nsis
+npm run tauri:build:dev-console -- --ci --no-sign --target x86_64-pc-windows-msvc --bundles nsis
+```
+
+## Runtime Atlas macOS PKG
+
+RuntimeAtlas bundle의 CLI를 `/usr/local/bin/runtime-atlas`에도 설치하는 비재배치 PKG를 만들 수 있습니다. 아래 명령은 ad-hoc 앱과 unsigned installer의 로컬 계약 검사입니다.
+
+PKG로 설치된 전역 CLI가 있으면 서명 updater가 앱과 CLI를 함께 교체하며, 권한 승인이 거부되거나 어느 한쪽 교체가 실패하면 둘 다 원래 상태로 되돌립니다. 전역 CLI가 없던 설치는 새로 만들지 않습니다.
+
+```sh
+APP=target/universal-apple-darwin/release/bundle/macos/RuntimeAtlas.app
+APP_SIGN_IDENTITY=- npm run package:runtime-atlas:macos -- "$APP" dist/RuntimeAtlas-0.1.0.pkg
+npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.1.0.pkg unsigned none
+npm run test:runtime-atlas:macos-package -- "$APP"
+```
+
+배포용 PKG는 `APP_SIGN_IDENTITY`에 Developer ID Application, `INSTALLER_SIGN_IDENTITY`에 같은 팀의 Developer ID Installer identity를 지정한 뒤 notarize·staple하고 다음 계약으로 검증합니다.
+
+```sh
+npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.1.0.pkg signed stapled
+```
+
+서명 updater와 릴리스에 필요한 외부 설정은 [GitHub 설정](docs/github-setup.md)에 있습니다.

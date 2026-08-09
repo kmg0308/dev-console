@@ -1,2 +1,7 @@
 .build/
 dist/
+src-tauri/binaries/
+node_modules/
+target/
+src-tauri/gen/
+*.log
