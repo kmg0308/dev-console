@@ -7,7 +7,7 @@
 - macOS 14와 Windows Server 2022에서 TypeScript build, Rust format·clippy·test
 - macOS universal `app,dmg`와 Windows x64 NSIS를 세 flavor별 unsigned build
 
-macOS 14 runner 결과는 macOS 13 실제 동작 증거가 아니며, Windows runner 결과도 Windows용 compile·test·package 증거일 뿐 Windows 10 22H2 실제 동작 증거가 아닙니다. 저장소 보호 규칙은 workflow의 모든 check를 요구하고 Actions 권한은 read-only로 유지합니다. 이 저장소에는 자동 push, dependency PR, release workflow가 없습니다.
+macOS 14 runner 결과는 macOS 13 실제 동작 증거가 아니며, Windows runner 결과도 Windows용 compile·test·package 증거일 뿐 Windows 10 22H2 실제 동작 증거가 아닙니다. 저장소 보호 규칙은 모든 검사와 bundle job이 성공할 때만 통과하는 aggregate `verify`를 요구하고 Actions 권한은 read-only로 유지합니다. 이 저장소에는 자동 push, dependency PR, release workflow가 없습니다.
 
 ## Updater와 서명
 

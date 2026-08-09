@@ -102,3 +102,12 @@ jobs:
           -MainBinaryName '${{ matrix.app.binary }}'
           -Version '${{ matrix.app.version }}'
           -RuntimeFeature '${{ matrix.app.runtime }}'
+
+  verify:
+    if: ${{ always() }}
+    needs: [checks, bundles]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          test "${{ needs.checks.result }}" = success
+          test "${{ needs.bundles.result }}" = success

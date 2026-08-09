@@ -46,10 +46,10 @@ $originalCodexHome = $env:CODEX_HOME
 $main = $null
 try {
     $localAppData = Join-Path $temporary "local-app-data"
-    $home = Join-Path $temporary "home"
-    New-Item -ItemType Directory -Force $localAppData, $home | Out-Null
+    $isolatedHome = Join-Path $temporary "home"
+    New-Item -ItemType Directory -Force $localAppData, $isolatedHome | Out-Null
     $env:LOCALAPPDATA = $localAppData
-    $env:HOME = $home
+    $env:HOME = $isolatedHome
     [Environment]::SetEnvironmentVariable("CODEX_HOME", $null, "Process")
 
     if ($RuntimeFeature -eq "true") {
