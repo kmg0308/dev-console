@@ -5,10 +5,11 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{self, Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
 use windows_sys::Win32::{
     Foundation::{CloseHandle, FALSE, STILL_ACTIVE},
     System::Threading::{
@@ -16,6 +17,8 @@ use windows_sys::Win32::{
         TerminateProcess,
     },
 };
+
+const DESCENDANT_PID_FILE_ENV: &str = "RUNTIME_ATLAS_TEST_DESCENDANT_PID_FILE";
 
 fn supervisor() -> Command {
     Command::new(env!("CARGO_BIN_EXE_runtime-atlas-supervisor"))
@@ -63,6 +66,18 @@ fn stop_process(pid: u32) {
             TerminateProcess(process, 1);
             CloseHandle(process);
         }
+    }
+}
+
+#[test]
+#[ignore = "process fixture"]
+fn job_object_batch_descendant_helper() {
+    let Some(pid_file) = env::var_os(DESCENDANT_PID_FILE_ENV) else {
+        return;
+    };
+    fs::write(pid_file, process::id().to_string()).unwrap();
+    loop {
+        thread::sleep(Duration::from_secs(60));
     }
 }
 
@@ -302,26 +317,21 @@ fn killing_the_supervisor_closes_the_job_and_removes_batch_descendants() {
     let directory = tempfile::tempdir().unwrap();
     let fixture_directory = directory.path().join("fixture");
     fs::create_dir(&fixture_directory).unwrap();
-    let script = fixture_directory.join("descendant.ps1");
-    fs::write(
-        &script,
-        "$child = Start-Process -FilePath \"$env:SystemRoot\\System32\\ping.exe\" -ArgumentList \"-t\",\"127.0.0.1\" -PassThru\n[IO.File]::WriteAllText($args[0], [string]$child.Id)\n$child.WaitForExit()\n",
-    )
-    .unwrap();
     let fixture = fixture_directory.join("descendant.cmd");
     fs::write(
         &fixture,
-        "@ECHO off\r\npowershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%~dp0descendant.ps1\" %*\r\n",
+        "@\"%~1\" --ignored --exact job_object_batch_descendant_helper --nocapture\r\n",
     )
     .unwrap();
     let pid_file = directory.path().join("descendant.pid");
     let mut supervisor = supervisor()
         .env("PATH", path_with_first(&fixture_directory))
         .env("PATHEXT", ".CMD;.EXE;.BAT")
+        .env(DESCENDANT_PID_FILE_ENV, &pid_file)
         .arg("--cwd")
         .arg(directory.path())
         .args(["--", "descendant"])
-        .arg(&pid_file)
+        .arg(env::current_exe().unwrap())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
