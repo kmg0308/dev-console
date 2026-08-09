@@ -960,18 +960,11 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_artifact_metadata_matches_for_raw_and_single_executable_zip() {
-        let system32 =
-            std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
-        let (bytes, raw) = ["notepad.exe", "cmd.exe", "where.exe"]
-            .into_iter()
-            .find_map(|name| {
-                let bytes = std::fs::read(system32.join(name)).ok()?;
-                let metadata = windows_artifact_metadata(&bytes).ok()?;
-                Some((bytes, metadata))
-            })
-            .expect("System32 must contain a stable PE with product metadata");
-        assert!(!raw.version.is_empty());
-        assert!(!raw.identity.is_empty());
+        // System binaries may keep their strings in a sibling MUI file; this resource is embedded.
+        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let raw = windows_artifact_metadata(&bytes).unwrap();
+        assert_eq!(raw.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(raw.identity, "DevConsole");
 
         let zipped =
             windows_artifact_metadata(&windows_test_zip(&[("setup.exe", &bytes)])).unwrap();

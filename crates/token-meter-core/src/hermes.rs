@@ -583,9 +583,10 @@ mod tests {
             HermesScanner::new(&database_path, TokenDeviceMetadata::local_fallback(), None);
         let started = std::time::Instant::now();
         let result = scanner.scan(|| false);
+        let elapsed = started.elapsed();
         connection.execute_batch("ROLLBACK").unwrap();
         assert!(result.events.is_empty());
         assert_eq!(result.parse_error_count, 1);
-        assert!(started.elapsed() < Duration::from_secs(7));
+        assert!(elapsed < Duration::from_secs(7));
     }
 }

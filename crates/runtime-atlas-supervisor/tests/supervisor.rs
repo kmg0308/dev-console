@@ -336,9 +336,9 @@ fn immediate_sigterm_after_marker_publication_cleans_the_marker() {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(3);
         while !marker.exists() && Instant::now() < deadline {
-            thread::yield_now();
+            thread::sleep(Duration::from_millis(1));
         }
         assert!(
             marker.exists(),

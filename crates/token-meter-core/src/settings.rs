@@ -103,6 +103,7 @@ impl TokenMeterSettings {
             file.write_all(&data)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
+            drop(file);
             replacement_started = true;
             crate::atomic_file::replace(&temp, path)
         })();
@@ -288,6 +289,23 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn replaces_existing_settings_after_closing_the_flushed_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let mut settings = TokenMeterSettings::load_or_import(&path, None, "device").unwrap();
+        settings.show_full_token_numbers = true;
+
+        settings.save(&path).unwrap();
+
+        assert!(
+            TokenMeterSettings::load(&path)
+                .unwrap()
+                .show_full_token_numbers
+        );
     }
 
     #[test]
