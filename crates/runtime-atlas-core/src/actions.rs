@@ -571,8 +571,14 @@ mod tests {
 
     fn fixture() -> (CustomActionDefinition, RepositoryStatus, WorktreeStatus) {
         let id = Uuid::new_v4();
+        #[cfg(windows)]
+        let (repository_path, worktree_path) =
+            (r"C:\tmp\runtime atlas", r"C:\tmp\runtime atlas\worktree");
+        #[cfg(not(windows))]
+        let (repository_path, worktree_path) =
+            ("/tmp/runtime atlas", "/tmp/runtime atlas/worktree");
         let selected = WorktreeStatus {
-            path: "/tmp/runtime atlas/worktree".into(),
+            path: worktree_path.into(),
             branch: Some("main".into()),
             detached: false,
             sha: "0123456789".into(),
@@ -583,7 +589,7 @@ mod tests {
         };
         let repository = RepositoryStatus {
             id,
-            path: "/tmp/runtime atlas".into(),
+            path: repository_path.into(),
             name: "runtime atlas".into(),
             availability: AvailabilityState::Available,
             unavailable_reason: None,
@@ -640,7 +646,7 @@ mod tests {
         );
         assert!(
             plan.display_command
-                .contains("'/tmp/runtime atlas/worktree'")
+                .contains(&format!("'{}'", selected.path))
         );
 
         action.kind = CustomActionKind::Session;
@@ -673,10 +679,11 @@ mod tests {
 
         action.command_template = "npm run remove -- {{target}}".into();
         action.inputs.truncate(1);
-        let values = BTreeMap::from([(
-            "target".into(),
-            "/tmp/runtime atlas/worktree/../../not-registered".into(),
-        )]);
+        #[cfg(windows)]
+        let unregistered = r"C:\tmp\not-registered";
+        #[cfg(not(windows))]
+        let unregistered = "/tmp/not-registered";
+        let values = BTreeMap::from([("target".into(), unregistered.into())]);
         assert!(matches!(
             plan_custom_action(&action, &values, &repository, &selected),
             Err(CustomActionError::InvalidWorktree(_))
