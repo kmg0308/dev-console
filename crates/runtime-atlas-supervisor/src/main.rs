@@ -2,7 +2,7 @@ use serde::Serialize;
 #[cfg(windows)]
 use std::{
     ffi::OsStr,
-    mem::{offset_of, size_of},
+    mem::size_of,
     os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
 };
 use std::{
@@ -613,7 +613,7 @@ fn rename_windows_at(file: &File, parent: &File, name: &OsStr) -> io::Result<()>
                 "session marker name is too long",
             )
         })?;
-    let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+    let buffer_bytes = size_of::<FILE_RENAME_INFO>()
         .checked_add(name_bytes as usize)
         .ok_or_else(|| {
             io::Error::new(
