@@ -960,11 +960,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_artifact_metadata_matches_for_raw_and_single_executable_zip() {
-        // System binaries may keep their strings in a sibling MUI file; this resource is embedded.
-        let bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("node.exe"))
+            .find(|path| path.is_file())
+            .expect("node.exe must be installed for this workspace");
+        let output = std::process::Command::new(&node)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let expected_version = std::str::from_utf8(&output.stdout)
+            .unwrap()
+            .trim()
+            .strip_prefix('v')
+            .unwrap();
+        let bytes = std::fs::read(node).unwrap();
         let raw = windows_artifact_metadata(&bytes).unwrap();
-        assert_eq!(raw.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(raw.identity, "DevConsole");
+        assert_eq!(raw.version, expected_version);
+        assert_eq!(raw.identity, "Node.js");
 
         let zipped =
             windows_artifact_metadata(&windows_test_zip(&[("setup.exe", &bytes)])).unwrap();

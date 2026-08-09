@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     collections::HashMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -15,6 +16,40 @@ use crate::{
 };
 
 const HERMES_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+thread_local! {
+    static HERMES_BUSY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+struct HermesBusyDeadline(Option<Instant>);
+
+impl HermesBusyDeadline {
+    fn start() -> Self {
+        let deadline = Instant::now() + HERMES_BUSY_TIMEOUT;
+        Self(HERMES_BUSY_DEADLINE.with(|current| current.replace(Some(deadline))))
+    }
+}
+
+impl Drop for HermesBusyDeadline {
+    fn drop(&mut self) {
+        HERMES_BUSY_DEADLINE.with(|current| current.set(self.0));
+    }
+}
+
+fn retry_hermes_busy(_: i32) -> bool {
+    HERMES_BUSY_DEADLINE.with(|current| {
+        let Some(remaining) = current
+            .get()
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        else {
+            return false;
+        };
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        current
+            .get()
+            .is_some_and(|deadline| Instant::now() < deadline)
+    })
+}
 
 #[derive(Debug, Default, PartialEq)]
 pub struct HermesScanOutcome {
@@ -83,14 +118,14 @@ impl<'a> HermesScanner<'a> {
         observed_at: DateTime<Utc>,
         is_cancelled: &impl Fn() -> bool,
     ) -> Result<Vec<TokenEvent>, HermesError> {
-        let busy_deadline = Instant::now() + HERMES_BUSY_TIMEOUT;
+        let _busy_deadline = HermesBusyDeadline::start();
         let connection = Connection::open_with_flags(
             &self.database_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )?;
-        apply_busy_deadline(&connection, busy_deadline)?;
+        connection.busy_handler(Some(retry_hermes_busy))?;
         connection.execute_batch("PRAGMA query_only = ON")?;
-        let sessions = read_sessions(&connection, busy_deadline, is_cancelled)?;
+        let sessions = read_sessions(&connection, is_cancelled)?;
         if is_cancelled() {
             return Ok(Vec::new());
         }
@@ -194,10 +229,9 @@ impl<'a> HermesScanner<'a> {
 
 fn read_sessions(
     connection: &Connection,
-    busy_deadline: Instant,
     is_cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<HermesSession>, HermesError> {
-    let session_columns = columns(connection, "sessions", busy_deadline)?;
+    let session_columns = columns(connection, "sessions")?;
     if !["id", "billing_provider", "started_at"]
         .into_iter()
         .all(|column| session_columns.contains(column))
@@ -217,7 +251,7 @@ fn read_sessions(
     {
         return Err(HermesError::IncompatibleSchema);
     }
-    let message_columns = columns(connection, "messages", busy_deadline)?;
+    let message_columns = columns(connection, "messages")?;
     let message_time =
         if message_columns.contains("session_id") && message_columns.contains("timestamp") {
             "(SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = s.id)"
@@ -251,16 +285,10 @@ fn read_sessions(
         expression("reasoning_tokens", "0"),
         expression("cwd", "NULL"),
     );
-    apply_busy_deadline(connection, busy_deadline)?;
     let mut statement = connection.prepare(&sql)?;
-    apply_busy_deadline(connection, busy_deadline)?;
     let mut rows = statement.query(["openai-codex"])?;
     let mut sessions = Vec::new();
-    loop {
-        apply_busy_deadline(connection, busy_deadline)?;
-        let Some(row) = rows.next()? else {
-            break;
-        };
+    while let Some(row) = rows.next()? {
         if is_cancelled() {
             return Ok(Vec::new());
         }
@@ -294,25 +322,11 @@ fn read_sessions(
 fn columns(
     connection: &Connection,
     table: &str,
-    busy_deadline: Instant,
 ) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
-    apply_busy_deadline(connection, busy_deadline)?;
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    apply_busy_deadline(connection, busy_deadline)?;
-    let mut rows = statement.query([])?;
-    let mut columns = std::collections::HashSet::new();
-    loop {
-        apply_busy_deadline(connection, busy_deadline)?;
-        let Some(row) = rows.next()? else {
-            break;
-        };
-        columns.insert(row.get(1)?);
-    }
-    Ok(columns)
-}
-
-fn apply_busy_deadline(connection: &Connection, deadline: Instant) -> Result<(), rusqlite::Error> {
-    connection.busy_timeout(deadline.saturating_duration_since(Instant::now()))
+    statement
+        .query_map([], |row| row.get(1))?
+        .collect::<Result<_, _>>()
 }
 
 fn normalized_date(raw: f64) -> Option<DateTime<Utc>> {

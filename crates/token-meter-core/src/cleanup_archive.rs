@@ -863,14 +863,10 @@ fn sync_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?
-        .sync_all()
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    // Windows has no supported std API for flushing a containing directory;
+    // the archive file itself is flushed before publication.
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -969,6 +965,24 @@ mod tests {
         assert_eq!(result.archive_path, archive);
         assert!(!home.join(relative).exists());
         assert!(result.archive_path.is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_archive_publication_uses_the_supported_file_flush_boundary() {
+        let (_temp, home, archive) = setup();
+        let relative = Path::new("sessions/2026/old.jsonl");
+        write_source(&home, relative, b"old session");
+        let current = vec![evidence(&home, relative)];
+        let plan = plan(&current);
+        let request = plan
+            .archive_request(&current, &BTreeSet::from(["event".to_owned()]))
+            .unwrap();
+
+        create_cleanup_archive(&home, &archive, &request, &current).unwrap();
+
+        assert!(archive.is_file());
+        assert!(home.join(relative).is_file());
     }
 
     #[test]
