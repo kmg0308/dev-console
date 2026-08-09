@@ -581,7 +581,7 @@ fn open_windows_probe(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn rename_windows_at(file: &File, parent: &File, name: &OsStr) -> io::Result<()> {
+fn rename_windows_at(file: &File, _parent: &File, name: &OsStr) -> io::Result<()> {
     use windows_sys::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
@@ -627,7 +627,8 @@ fn rename_windows_at(file: &File, parent: &File, name: &OsStr) -> io::Result<()>
     unsafe {
         info.write(FILE_RENAME_INFO::default());
         (*info).Anonymous.ReplaceIfExists = false;
-        (*info).RootDirectory = parent.as_raw_handle() as HANDLE;
+        // A simple name with a null root stays in the opened file's current directory.
+        (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             name.as_ptr(),
