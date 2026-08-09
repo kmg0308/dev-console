@@ -1137,14 +1137,10 @@ mod platform {
         }
     }
 
-    fn batch_command_line(
-        command: &Path,
-        script: &Path,
-        arguments: &[OsString],
-    ) -> io::Result<Vec<u16>> {
-        let mut command_line = Vec::new();
-        append_quoted(command.as_os_str(), &mut command_line)?;
-        command_line.extend(" /e:ON /v:OFF /d /c \"".encode_utf16());
+    fn batch_command_line(script: &Path, arguments: &[OsString]) -> io::Result<Vec<u16>> {
+        // lpApplicationName pins the verified System32 executable; keep the command-line
+        // prefix aligned with Rust std's batch parser contract.
+        let mut command_line: Vec<u16> = "cmd.exe /e:ON /v:OFF /d /c \"".encode_utf16().collect();
         if matches!(
             script.components().next(),
             Some(Component::Prefix(prefix))
@@ -1192,8 +1188,8 @@ mod platform {
         invocation.executable = resolve_executable(&invocation.executable)?.into_os_string();
         let executable = Path::new(&invocation.executable);
         if matches!(executable_extension(executable), Some("cmd" | "bat")) {
-            let command = system_command_processor()?;
-            batch_command_line(&command, executable, &invocation.arguments)?;
+            system_command_processor()?;
+            batch_command_line(executable, &invocation.arguments)?;
         } else {
             command_line(&invocation.executable, &invocation.arguments)?;
         }
@@ -1210,7 +1206,7 @@ mod platform {
         };
         let application = wide_nul(command.as_os_str())?;
         let mut command_line = if is_batch {
-            batch_command_line(&command, executable, &invocation.arguments)?
+            batch_command_line(executable, &invocation.arguments)?
         } else {
             command_line(&invocation.executable, &invocation.arguments)?
         };
@@ -1394,13 +1390,15 @@ mod platform {
             let invalid_unicode = OsString::from_wide(&[0xd800]);
             assert!(append_batch_argument(&mut Vec::new(), &invalid_unicode).is_err());
             let arguments = vec![OsString::from("x".repeat(8_192))];
-            assert!(
-                batch_command_line(
-                    Path::new(r"C:\Windows\System32\cmd.exe"),
-                    Path::new(r"C:\fixture.cmd"),
-                    &arguments,
-                )
-                .is_err()
+            assert!(batch_command_line(Path::new(r"C:\fixture.cmd"), &arguments).is_err());
+        }
+
+        #[test]
+        fn uses_the_cmd_exe_argv_zero_expected_by_the_batch_parser() {
+            let command_line = batch_command_line(Path::new(r"C:\fixture.cmd"), &[]).unwrap();
+            assert_eq!(
+                String::from_utf16(&command_line[..command_line.len() - 1]).unwrap(),
+                r#"cmd.exe /e:ON /v:OFF /d /c ""C:\fixture.cmd"""#
             );
         }
     }

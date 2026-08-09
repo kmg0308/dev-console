@@ -72,7 +72,7 @@ fn preserves_windows_cwd_arguments_streams_and_exit_code() {
     let fixture = directory.path().join("fixture.ps1");
     fs::write(
         &fixture,
-        "[Console]::Out.WriteLine((Get-Location).Path)\n[Console]::Out.WriteLine($args[0])\n[Console]::Out.WriteLine($args[1])\n[Console]::Error.WriteLine('fixture-error')\nexit 7\n",
+        "[IO.File]::WriteAllText('.runtime-atlas-cwd-proof', 'same-directory')\n[Console]::Out.WriteLine($args[0])\n[Console]::Out.WriteLine($args[1])\n[Console]::Error.WriteLine('fixture-error')\nexit 7\n",
     )
     .unwrap();
 
@@ -99,12 +99,11 @@ fn preserves_windows_cwd_arguments_streams_and_exit_code() {
         .lines()
         .map(str::to_owned)
         .collect();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines, ["first argument", "--literal"]);
     assert_eq!(
-        lines[0].to_lowercase(),
-        directory.path().display().to_string().to_lowercase()
+        fs::read_to_string(directory.path().join(".runtime-atlas-cwd-proof")).unwrap(),
+        "same-directory"
     );
-    assert_eq!(&lines[1..], ["first argument", "--literal"]);
     assert_eq!(
         String::from_utf8_lossy(&output.stderr).trim(),
         "fixture-error"
