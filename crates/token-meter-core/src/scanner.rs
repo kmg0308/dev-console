@@ -582,14 +582,14 @@ fn enumerate_jsonl(
             {
                 continue;
             }
-            let Ok(metadata) = entry.metadata() else {
+            let path = entry.path();
+            let Ok(metadata) = fs::metadata(&path) else {
                 continue;
             };
             let Ok(modified) = metadata.modified() else {
                 continue;
             };
             let modified_at: DateTime<Utc> = modified.into();
-            let path = entry.path();
             files.push(LogFile {
                 snapshot: FileSnapshot {
                     path: canonical_or_owned(&path).to_string_lossy().into_owned(),
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_appends_growth_and_deduplicates_requests() {
+    fn cache_observes_growth_with_an_open_writer_and_deduplicates_requests() {
         let directory = tempdir().unwrap();
         let roots = roots(directory.path());
         let path = configured(&roots.claude_projects).join("one.jsonl");
