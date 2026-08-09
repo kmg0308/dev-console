@@ -266,11 +266,12 @@ fn rewrite_local_ledger_v2_unlocked_with(
             identity: temp_identity,
         };
         #[cfg(not(target_os = "macos"))]
-        let temp_probe = {
-            drop(file);
-            open_regular_replace_probe(&temp)?
-        };
-        if temp_probe.identity != temp_identity {
+        drop(file);
+        #[cfg(target_os = "macos")]
+        let observed_temp_identity = temp_probe.identity;
+        #[cfg(not(target_os = "macos"))]
+        let observed_temp_identity = current_replace_compatible_identity(&temp)?;
+        if observed_temp_identity != temp_identity {
             return Err(identity_changed("temporary sync ledger changed after writing").into());
         }
         boundary.validate_target(path, expected_identity)?;
@@ -285,8 +286,22 @@ fn rewrite_local_ledger_v2_unlocked_with(
             boundary,
             &mut namespace_mutated,
         )?;
-        #[cfg(not(target_os = "macos"))]
-        replace_ledger_identity_bound(&temp, path, &temp_probe, existing.as_ref(), boundary)?;
+        #[cfg(target_os = "windows")]
+        replace_ledger_identity_bound(
+            &temp,
+            path,
+            observed_temp_identity,
+            existing.as_ref(),
+            boundary,
+        )?;
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        replace_ledger_identity_bound(
+            &temp,
+            path,
+            observed_temp_identity,
+            existing.as_ref(),
+            boundary,
+        )?;
         Ok(())
     })();
     #[cfg(target_os = "macos")]
@@ -314,12 +329,13 @@ fn replace_ledger_identity_bound(
     boundary: &LedgerBoundary,
     namespace_mutated: &mut bool,
 ) -> Result<(), SyncError> {
+    let temp_identity = temp_probe.identity;
     if let Some(existing) = existing {
         renameatx(boundary, temp, destination, libc::RENAME_SWAP)?;
         *namespace_mutated = true;
         let destination_after = open_regular_replace_probe(destination)?;
         let displaced_after = open_regular_replace_probe(temp)?;
-        if destination_after.identity == temp_probe.identity
+        if destination_after.identity == temp_identity
             && displaced_after.identity == existing.identity
         {
             remove_checked_temp(boundary, temp, existing.identity)?;
@@ -331,15 +347,15 @@ fn replace_ledger_identity_bound(
         renameatx(boundary, temp, destination, libc::RENAME_SWAP)?;
         boundary.validate_target(destination, Some(displaced_after.identity))?;
         boundary.validate_target(temp, Some(destination_after.identity))?;
-        if destination_after.identity == temp_probe.identity {
-            remove_checked_temp(boundary, temp, temp_probe.identity)?;
+        if destination_after.identity == temp_identity {
+            remove_checked_temp(boundary, temp, temp_identity)?;
         }
         return Err(identity_changed("sync ledger destination changed during replacement").into());
     }
 
     renameatx(boundary, temp, destination, libc::RENAME_EXCL)?;
     *namespace_mutated = true;
-    boundary.validate_target(destination, Some(temp_probe.identity))?;
+    boundary.validate_target(destination, Some(temp_identity))?;
     boundary._devices_file.sync_all()?;
     Ok(())
 }
@@ -414,31 +430,31 @@ fn map_race_safe_rename_error(error: io::Error) -> io::Error {
 fn replace_ledger_identity_bound(
     temp: &Path,
     destination: &Path,
-    temp_probe: &OpenedLedger,
+    temp_identity: FileIdentity,
     existing: Option<&OpenedLedger>,
     boundary: &LedgerBoundary,
 ) -> Result<(), SyncError> {
     let Some(existing) = existing else {
         fs::rename(temp, destination)?;
         let destination_after = open_regular_replace_probe(destination)?;
-        if destination_after.identity != temp_probe.identity {
+        if destination_after.identity != temp_identity {
             return Err(
                 identity_changed("sync ledger destination changed during replacement").into(),
             );
         }
-        boundary.validate_target(destination, Some(temp_probe.identity))?;
+        boundary.validate_target(destination, Some(temp_identity))?;
         return Ok(());
     };
+    let existing_identity = existing.identity;
 
     let backup = recovery_sibling(destination, "backup");
     boundary.validate_target(&backup, None)?;
     replace_file_windows(temp, destination, &backup)?;
     let destination_after = open_regular_replace_probe(destination)?;
     let displaced_after = open_regular_replace_probe(&backup)?;
-    if destination_after.identity == temp_probe.identity
-        && displaced_after.identity == existing.identity
+    if destination_after.identity == temp_identity && displaced_after.identity == existing_identity
     {
-        remove_exact_leaf(boundary, &backup, existing.identity)?;
+        remove_exact_leaf(boundary, &backup, existing_identity)?;
         return Ok(());
     }
 
@@ -448,11 +464,13 @@ fn replace_ledger_identity_bound(
     let displaced_identity = displaced_after.identity;
     boundary.validate_target(destination, Some(destination_identity))?;
     boundary.validate_target(&backup, Some(displaced_identity))?;
+    drop(destination_after);
+    drop(displaced_after);
     replace_file_windows(&backup, destination, &rollback)?;
     boundary.validate_target(destination, Some(displaced_identity))?;
     boundary.validate_target(&rollback, Some(destination_identity))?;
-    if destination_identity == temp_probe.identity {
-        remove_exact_leaf(boundary, &rollback, temp_probe.identity)?;
+    if destination_identity == temp_identity {
+        remove_exact_leaf(boundary, &rollback, temp_identity)?;
     }
     Err(identity_changed("sync ledger destination changed during replacement").into())
 }
@@ -499,12 +517,12 @@ fn replace_file_windows(replacement: &Path, destination: &Path, backup: &Path) -
 fn replace_ledger_identity_bound(
     temp: &Path,
     destination: &Path,
-    temp_probe: &OpenedLedger,
+    temp_identity: FileIdentity,
     _: Option<&OpenedLedger>,
     boundary: &LedgerBoundary,
 ) -> Result<(), SyncError> {
     fs::rename(temp, destination)?;
-    boundary.validate_target(destination, Some(temp_probe.identity))?;
+    boundary.validate_target(destination, Some(temp_identity))?;
     boundary._devices_file.sync_all()?;
     Ok(())
 }
@@ -1239,8 +1257,29 @@ mod tests {
         });
 
         assert!(result.is_err());
+        #[cfg(target_os = "windows")]
+        match &result {
+            Err(SyncError::Io(error)) => assert_ne!(error.raw_os_error(), Some(32)),
+            other => panic!("unexpected replacement race result: {other:?}"),
+        }
         assert_eq!(fs::read(&path).unwrap(), b"competing destination\n");
         assert_eq!(fs::read(&moved).unwrap(), original);
+        assert!(recovery_files(&path).is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_rewrite_closes_the_replacement_source_before_replace_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/windows.jsonl");
+        rewrite_local_ledger_v2(&path, [record("windows", "original", 1)]).unwrap();
+
+        rewrite_local_ledger_v2(&path, [record("windows", "replacement", 2)]).unwrap();
+
+        assert_eq!(
+            read_ledger(&path, None).unwrap().records[0].event_id,
+            "replacement"
+        );
         assert!(recovery_files(&path).is_empty());
     }
 
