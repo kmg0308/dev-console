@@ -1105,7 +1105,7 @@ mod platform {
                     command_line.extend(std::iter::repeat_n('\\' as u16, backslashes));
                     command_line.push('"' as u16);
                 } else if unit == '%' as u16 {
-                    command_line.extend("%%cd:~,%".encode_utf16());
+                    command_line.extend("%%cd:~,".encode_utf16());
                 }
                 backslashes = 0;
             }
@@ -1369,7 +1369,7 @@ mod platform {
                 ("", "\"\""),
                 ("test", "test"),
                 ("한글", "한글"),
-                ("%PATH%", r#""%%cd:~,%%PATH%%cd:~,%%""#),
+                ("%PATH%", r#""%%cd:~,%PATH%%cd:~,%""#),
                 ("hello world", r#""hello world""#),
                 (r#"quote"inside"#, r#""quote""inside""#),
                 (r#"hello world\"#, r#""hello world\\""#),
