@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::process::{Command, Output};
 
+use crate::command::output as command_output;
 use crate::git::{WorktreeAvailability, inspect_parsed_worktree, parse_worktree_porcelain};
 use crate::models::{
     AvailabilityState, RepositoryRegistration, RepositoryStatus, WorktreeStatus,
@@ -11,10 +12,12 @@ use crate::storage::canonical_path;
 
 const MISSING_REPOSITORY: &str = "Repository path is missing.";
 const GIT_REPOSITORY_FAILED: &str = "Git could not inspect this repository.";
+const GIT_REPOSITORY_TIMED_OUT: &str = "Git repository inspection timed out.";
 const NOT_GIT_REPOSITORY: &str = "Path is not an available Git repository.";
 const NO_WORKTREES: &str = "No Git worktrees were found.";
 const MISSING_WORKTREE: &str = "Worktree path is missing.";
 const GIT_WORKTREE_FAILED: &str = "Git could not inspect this worktree.";
+const GIT_WORKTREE_TIMED_OUT: &str = "Git worktree inspection timed out.";
 
 /// Inspects only the registered paths, in their stored order, using the caller-provided Git.
 pub fn inspect_repositories(
@@ -46,12 +49,20 @@ fn inspect_repository(
         return unavailable_repository(registration, name, MISSING_REPOSITORY);
     }
 
-    let Ok(listing) = run_git(
+    let listing = match run_git(
         git_executable,
         &registration.path,
         &["worktree", "list", "--porcelain"],
-    ) else {
-        return unavailable_repository(registration, name, GIT_REPOSITORY_FAILED);
+    ) {
+        Ok(listing) => listing,
+        Err(error) => {
+            let reason = if error.kind() == std::io::ErrorKind::TimedOut {
+                GIT_REPOSITORY_TIMED_OUT
+            } else {
+                GIT_REPOSITORY_FAILED
+            };
+            return unavailable_repository(registration, name, reason);
+        }
     };
     if !listing.status.success() {
         return unavailable_repository(registration, name, NOT_GIT_REPOSITORY);
@@ -69,15 +80,21 @@ fn inspect_repository(
         .map(|parsed| {
             let path = canonical_path(Path::new(&parsed.path));
             let path_exists = Path::new(&path).is_dir();
+            let mut timed_out = false;
             let status = path_exists
                 .then(|| {
-                    run_git(
+                    match run_git(
                         git_executable,
                         &path,
                         &["status", "--porcelain", "--untracked-files=normal"],
-                    )
-                    .ok()
-                    .filter(|output| output.status.success())
+                    ) {
+                        Ok(output) if output.status.success() => Some(output),
+                        Err(error) => {
+                            timed_out = error.kind() == std::io::ErrorKind::TimedOut;
+                            None
+                        }
+                        Ok(_) => None,
+                    }
                 })
                 .flatten();
             let inspected = inspect_parsed_worktree(
@@ -96,7 +113,11 @@ fn inspect_repository(
                 ),
                 WorktreeAvailability::GitUnavailable => (
                     AvailabilityState::Unavailable,
-                    Some(GIT_WORKTREE_FAILED.to_owned()),
+                    Some(if timed_out {
+                        GIT_WORKTREE_TIMED_OUT.to_owned()
+                    } else {
+                        GIT_WORKTREE_FAILED.to_owned()
+                    }),
                 ),
             };
             WorktreeStatus {
@@ -116,27 +137,7 @@ fn inspect_repository(
         .get(&repository_uuid_key(registration.id))
         .or_else(|| worktree_order_by_repository.get(&registration.id.to_string()));
     if let Some(preferred_order) = preferred_order {
-        let ranks: HashMap<_, _> = preferred_order
-            .iter()
-            .enumerate()
-            .map(|(rank, key)| (key.as_str(), rank))
-            .collect();
-        worktrees.sort_by_key(|worktree| {
-            ranks
-                .get(worktree.path.as_str())
-                .or_else(|| {
-                    ranks.get(
-                        worktree_order_key(
-                            worktree.branch.as_deref(),
-                            worktree.detached,
-                            &worktree.sha,
-                        )
-                        .as_str(),
-                    )
-                })
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
+        sort_worktrees(&mut worktrees, preferred_order);
     }
 
     RepositoryStatus {
@@ -149,8 +150,60 @@ fn inspect_repository(
     }
 }
 
+pub fn expand_worktree_order(
+    paths: &[String],
+    worktrees: &[WorktreeStatus],
+) -> Option<Vec<String>> {
+    if paths.len() != worktrees.len() {
+        return None;
+    }
+    let by_path: HashMap<_, _> = worktrees
+        .iter()
+        .map(|worktree| (worktree.path.as_str(), worktree))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut expanded = Vec::with_capacity(paths.len() * 2);
+    for path in paths {
+        let worktree = by_path.get(path.as_str())?;
+        if !seen.insert(path) {
+            return None;
+        }
+        expanded.push(path.clone());
+        expanded.push(worktree_order_key(
+            worktree.branch.as_deref(),
+            worktree.detached,
+            &worktree.sha,
+        ));
+    }
+    Some(expanded)
+}
+
+fn sort_worktrees(worktrees: &mut [WorktreeStatus], preferred_order: &[String]) {
+    let mut ranks = HashMap::new();
+    for (rank, key) in preferred_order.iter().enumerate() {
+        ranks.entry(key.as_str()).or_insert(rank);
+    }
+    worktrees.sort_by_key(|worktree| {
+        ranks
+            .get(worktree.path.as_str())
+            .or_else(|| {
+                ranks.get(
+                    worktree_order_key(
+                        worktree.branch.as_deref(),
+                        worktree.detached,
+                        &worktree.sha,
+                    )
+                    .as_str(),
+                )
+            })
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+}
+
 fn run_git(git_executable: &Path, directory: &str, arguments: &[&str]) -> std::io::Result<Output> {
-    Command::new(git_executable)
+    let mut command = Command::new(git_executable);
+    command
         .args([
             "--no-optional-locks",
             "-c",
@@ -158,8 +211,8 @@ fn run_git(git_executable: &Path, directory: &str, arguments: &[&str]) -> std::i
             "-C",
             directory,
         ])
-        .args(arguments)
-        .output()
+        .args(arguments);
+    command_output(&mut command)
 }
 
 fn unavailable_repository(
@@ -203,6 +256,75 @@ mod tests {
             path: path.to_string_lossy().into_owned(),
             added_at: Utc::now(),
         }
+    }
+
+    fn worktree(path: &str, branch: Option<&str>, sha: &str) -> WorktreeStatus {
+        WorktreeStatus {
+            path: path.to_owned(),
+            branch: branch.map(str::to_owned),
+            detached: branch.is_none(),
+            sha: sha.to_owned(),
+            short_sha: sha.chars().take(7).collect(),
+            dirty: false,
+            availability: AvailabilityState::Available,
+            unavailable_reason: None,
+        }
+    }
+
+    #[test]
+    fn exact_order_distinguishes_equal_detached_heads_and_stable_keys_restore_moved_paths() {
+        let original = vec![
+            worktree("/detached-one", None, "1234567890abcdef"),
+            worktree("/detached-two", None, "1234567890abcdef"),
+            worktree("/main", Some("main"), "1234567890abcdef"),
+        ];
+        let requested = vec![
+            "/detached-two".to_owned(),
+            "/detached-one".to_owned(),
+            "/main".to_owned(),
+        ];
+        let expanded = expand_worktree_order(&requested, &original).unwrap();
+        assert_eq!(
+            expanded,
+            [
+                "/detached-two",
+                "detached:1234567890abcdef",
+                "/detached-one",
+                "detached:1234567890abcdef",
+                "/main",
+                "branch:main",
+            ]
+        );
+
+        let mut current = original.clone();
+        sort_worktrees(&mut current, &expanded);
+        assert_eq!(
+            current
+                .iter()
+                .map(|worktree| worktree.path.as_str())
+                .collect::<Vec<_>>(),
+            requested.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        current[0].path = "/detached-two-moved".to_owned();
+        sort_worktrees(&mut current, &expanded);
+        assert_eq!(
+            current
+                .iter()
+                .map(|worktree| worktree.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/detached-two-moved", "/detached-one", "/main"]
+        );
+
+        sort_worktrees(
+            &mut current,
+            &[
+                "branch:main".to_owned(),
+                "detached:1234567890abcdef".to_owned(),
+            ],
+        );
+        assert_eq!(current[0].path, "/main");
+        assert!(expand_worktree_order(&requested[..2], &original).is_none());
     }
 
     #[test]

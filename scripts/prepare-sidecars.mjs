@@ -40,6 +40,11 @@ for (const helper of helpers) {
   }
   if (!extension) {
     await chmod(destination, 0o755);
+    if (helper === "runtime-atlas" && triple.endsWith("apple-darwin")) {
+      const appHelper = join(root, "src-tauri", "binaries", "runtime-atlas-app-helper");
+      copyFileSync(destination, appHelper);
+      await chmod(appHelper, 0o755);
+    }
     if (triple === "universal-apple-darwin") {
       await chmod(join(root, "src-tauri", "binaries", `${helper}-aarch64-apple-darwin`), 0o755);
       await chmod(join(root, "src-tauri", "binaries", `${helper}-x86_64-apple-darwin`), 0o755);

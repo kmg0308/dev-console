@@ -15,6 +15,8 @@ use crate::relations::{
     UserProcessLink, WorktreeRef, build_process_relations, relate_container_mounts,
 };
 use crate::repository::inspect_repositories;
+use crate::sessions::reconcile_action_sessions;
+use crate::storage::RuntimeAtlasPaths;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositorySnapshotInput {
@@ -80,15 +82,32 @@ pub struct RuntimeAtlasSnapshot {
     pub action_runs: Vec<ActionRun>,
 }
 
+pub struct ObservedSnapshotInput<'a> {
+    pub paths: &'a RuntimeAtlasPaths,
+    pub configuration: RuntimeAtlasConfiguration,
+    pub recovery_notice: Option<String>,
+    pub default_language: AppLanguage,
+    pub git_executable: &'a Path,
+    pub expected_supervisor: &'a Path,
+    pub path_flavor: PathFlavor,
+    pub process_observation: ProcessObservation,
+    pub docker_observation: DockerObservation,
+}
+
 pub fn build_observed_snapshot(
-    configuration: RuntimeAtlasConfiguration,
-    recovery_notice: Option<String>,
-    default_language: AppLanguage,
-    git_executable: &Path,
-    path_flavor: PathFlavor,
-    process_observation: ProcessObservation,
-    docker_observation: DockerObservation,
-) -> RuntimeAtlasSnapshot {
+    input: ObservedSnapshotInput<'_>,
+) -> Result<RuntimeAtlasSnapshot, String> {
+    let ObservedSnapshotInput {
+        paths,
+        configuration,
+        recovery_notice,
+        default_language,
+        git_executable,
+        expected_supervisor,
+        path_flavor,
+        process_observation,
+        docker_observation,
+    } = input;
     let mut notices = process_observation.notices;
     notices.extend(docker_observation.notices);
     if let Some(message) = recovery_notice {
@@ -101,15 +120,24 @@ pub fn build_observed_snapshot(
         &configuration.repositories,
         &configuration.worktree_order_by_repository,
         git_executable,
-    )
-    .into_iter()
-    .map(|repository| RepositorySnapshotInput {
-        repository,
+    );
+    let sessions = reconcile_action_sessions(
+        paths,
+        &configuration.custom_actions,
+        &repositories,
+        &process_observation.processes,
+        expected_supervisor,
         path_flavor,
-    })
-    .collect();
+    )?;
+    let repositories = repositories
+        .into_iter()
+        .map(|repository| RepositorySnapshotInput {
+            repository,
+            path_flavor,
+        })
+        .collect();
 
-    build_snapshot(RuntimeAtlasSnapshotInput {
+    Ok(build_snapshot(RuntimeAtlasSnapshotInput {
         generated_at: Utc::now(),
         language: configuration.app_language.unwrap_or(default_language),
         process_discovery: process_observation.availability,
@@ -117,12 +145,12 @@ pub fn build_observed_snapshot(
         notices,
         repositories,
         observed_processes: process_observation.processes,
-        managed_sessions: Vec::new(),
+        managed_sessions: sessions.managed_sessions,
         user_links: configuration.process_links,
         containers: docker_observation.containers,
         actions: configuration.custom_actions,
-        action_runs: Vec::new(),
-    })
+        action_runs: sessions.action_runs,
+    }))
 }
 
 /// Composes caller-verified observations without performing filesystem or process discovery.

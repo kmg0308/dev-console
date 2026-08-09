@@ -27,6 +27,7 @@ export function RuntimeAtlas() {
   const [busy, setBusy] = useState(false);
   const [editingAction, setEditingAction] = useState<CustomAction>();
   const selectedPathRef = useRef<string | undefined>(undefined);
+  const navigationStartPath = useRef<string | undefined>(undefined);
   const navigationQueue = useRef<Promise<void>>(Promise.resolve());
 
   const refresh = useCallback(async () => {
@@ -67,19 +68,35 @@ export function RuntimeAtlas() {
     };
     const advance = (event: Event) => enqueue(async () => {
       const { forward } = (event as CustomEvent<{ forward: boolean }>).detail;
+      navigationStartPath.current ??= selectedPathRef.current;
       const path = await runtimeAtlasCommands.advanceWorktreeNavigation(selectedPathRef.current, forward);
       if (active && path) {
         selectedPathRef.current = path;
         setSelectedPath(path);
       }
     });
-    const commit = () => enqueue(() => runtimeAtlasCommands.commitWorktreeNavigation());
+    const commit = () => enqueue(async () => {
+      await runtimeAtlasCommands.commitWorktreeNavigation();
+      navigationStartPath.current = undefined;
+    });
+    const cancel = () => enqueue(async () => {
+      await runtimeAtlasCommands.cancelWorktreeNavigation();
+      const path = navigationStartPath.current;
+      navigationStartPath.current = undefined;
+      if (active && path) {
+        selectedPathRef.current = path;
+        setSelectedPath(path);
+      }
+    });
     window.addEventListener("runtime-atlas:advance-worktree-navigation", advance);
     window.addEventListener("runtime-atlas:commit-worktree-navigation", commit);
+    window.addEventListener("runtime-atlas:cancel-worktree-navigation", cancel);
     return () => {
       active = false;
       window.removeEventListener("runtime-atlas:advance-worktree-navigation", advance);
       window.removeEventListener("runtime-atlas:commit-worktree-navigation", commit);
+      window.removeEventListener("runtime-atlas:cancel-worktree-navigation", cancel);
+      enqueue(() => runtimeAtlasCommands.cancelWorktreeNavigation());
     };
   }, []);
 
@@ -124,6 +141,7 @@ export function RuntimeAtlas() {
   };
 
   const selectWorktree = (path: string) => {
+    navigationStartPath.current = undefined;
     selectedPathRef.current = path;
     setSelectedPath(path);
     void runtimeAtlasCommands.recordWorktreeSelection(path).catch((reason) => setError(String(reason)));
@@ -198,6 +216,8 @@ export function RuntimeAtlas() {
                   ))) void mutate(() => runtimeAtlasCommands.removeRepository(repository.id));
                 }}
                 reorder={(keys) => void mutate(() => runtimeAtlasCommands.setWorktreeOrder(repository.id, keys))}
+                open={(path) => void runtimeAtlasCommands.openWorktreeInVsCode(path)
+                  .catch((reason) => setError(String(reason)))}
                 korean={isKorean}
                 busy={busy}
               />
@@ -246,12 +266,13 @@ export function RuntimeAtlas() {
   );
 }
 
-function RepositoryGroup({ repository, selectedPath, select, remove, reorder, korean, busy }: {
+function RepositoryGroup({ repository, selectedPath, select, remove, reorder, open, korean, busy }: {
   repository: Repository;
   selectedPath?: string;
   select: (path: string) => void;
   remove: () => void;
   reorder: (keys: string[]) => void;
+  open: (path: string) => void;
   korean: boolean;
   busy: boolean;
 }) {
@@ -289,6 +310,7 @@ function RepositoryGroup({ repository, selectedPath, select, remove, reorder, ko
             <small>{worktree.detached ? text("분리된 HEAD", "Detached HEAD") : worktree.branch || text("브랜치 없음", "No branch")} · {worktree.shortSHA || "—"}</small>
           </button>
           <div className="atlas-worktree-order">
+            <button type="button" disabled={busy || worktree.availability !== "available"} aria-label={text(`${leafName(worktree.path)}을 VS Code로 열기`, `Open ${leafName(worktree.path)} in VS Code`)} onClick={() => open(worktree.path)}>VS Code</button>
             <button type="button" disabled={busy || index === 0} aria-label={text(`${leafName(worktree.path)} 위로 이동`, `Move ${leafName(worktree.path)} up`)} onClick={() => move(index, -1)}>↑</button>
             <button type="button" disabled={busy || index === repository.worktrees.length - 1} aria-label={text(`${leafName(worktree.path)} 아래로 이동`, `Move ${leafName(worktree.path)} down`)} onClick={() => move(index, 1)}>↓</button>
           </div>
@@ -502,7 +524,7 @@ function ActionRow({ action, run, worktree, allWorktrees, korean, busy, mutate, 
       <div className="atlas-row-actions">
         <button type="button" onClick={edit} disabled={busy || planning || ["pending", "running"].includes(run?.phase || "")}>{text("편집", "Edit")}</button>
         <button type="button" onClick={() => void execute(false)} disabled={busy || planning || worktree.availability !== "available" || ["pending", "running"].includes(run?.phase || "")}>{planning ? text("검토 준비 중…", "Preparing review…") : action.kind === "session" ? text("시작", "Start") : text("실행", "Run")}</button>
-        {action.kind === "session" && action.restartCommandTemplate && <button type="button" onClick={() => void execute(true)} disabled={busy || planning || worktree.availability !== "available" || run?.phase === "pending"}>{text("재시작", "Restart")}</button>}
+        {action.kind === "session" && action.restartCommandTemplate && run?.phase === "running" && <button type="button" onClick={() => void execute(true)} disabled={busy || planning || worktree.availability !== "available"}>{text("재시작", "Restart")}</button>}
         {action.kind === "session" && run?.managed && ["pending", "running", "restarting", "stopping"].includes(run.phase) && <button type="button" className="danger-text" disabled={busy} onClick={() => void mutate(() => runtimeAtlasCommands.stopAction(action.id, worktree.path))}>{text("중지", "Stop")}</button>}
         <button type="button" className="danger-text" disabled={busy || ["pending", "running"].includes(run?.phase || "")} onClick={() => {
           if (window.confirm(text(`${action.name} 작업을 삭제할까요?`, `Delete ${action.name}?`))) void mutate(() => runtimeAtlasCommands.deleteAction(action.id));

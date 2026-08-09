@@ -38,6 +38,13 @@ fn active_control_file(directory: &Path) -> PathBuf {
     control
 }
 
+fn control_identity(path: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).unwrap();
+    format!("unix:{}:{}", metadata.dev(), metadata.ino())
+}
+
 #[cfg(target_os = "macos")]
 fn mac_start_identity(pid: u32) -> String {
     use std::mem::{MaybeUninit, size_of};
@@ -95,6 +102,8 @@ fn rejects_incomplete_or_invalid_managed_session_arguments_as_usage() {
         .arg(&marker)
         .args(["--control-file"])
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args([
             "--action-id",
             "00000000-0000-0000-0000-000000000000",
@@ -147,6 +156,28 @@ fn preserves_cwd_arguments_streams_and_exit_code() {
         )
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "fixture-error\n");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn supplies_its_inherited_environment_to_the_direct_child() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = supervisor()
+        .env_clear()
+        .env("RUNTIME_ATLAS_INHERITED_ENV", "fixture-value")
+        .arg("--cwd")
+        .arg(directory.path())
+        .args(["--", "/usr/bin/env", "-0"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        output
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"RUNTIME_ATLAS_INHERITED_ENV=fixture-value")
+    );
 }
 
 #[test]
@@ -263,6 +294,8 @@ fn writes_exact_session_marker_before_launch_and_cleans_it_after_exit() {
         .arg(&marker)
         .arg("--control-file")
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args(["--action-id", action_id, "--worktree"])
         .arg(directory.path())
         .arg("--cwd")
@@ -323,6 +356,8 @@ fn immediate_sigterm_after_marker_publication_cleans_the_marker() {
             .arg(&marker)
             .arg("--control-file")
             .arg(&control)
+            .arg("--control-identity")
+            .arg(control_identity(&control))
             .args([
                 "--action-id",
                 "018f47a2-bbab-7de0-8000-0123456789ac",
@@ -371,6 +406,8 @@ fn never_overwrites_an_existing_session_marker() {
         .arg(&marker)
         .arg("--control-file")
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args([
             "--action-id",
             "018f47a2-bbab-7de0-8000-0123456789ac",
@@ -411,6 +448,8 @@ fn cancelled_control_never_publishes_a_marker_or_starts_the_child() {
         .arg(&marker)
         .arg("--control-file")
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args([
             "--action-id",
             "018f47a2-bbab-7de0-8000-0123456789ac",
@@ -447,6 +486,8 @@ fn control_shared_lock_is_held_for_the_supervisor_lifetime() {
         .arg(&marker)
         .arg("--control-file")
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args([
             "--action-id",
             "018f47a2-bbab-7de0-8000-0123456789ac",
@@ -509,6 +550,8 @@ fn rejects_a_control_symlink_without_touching_its_target() {
         .arg(&marker)
         .arg("--control-file")
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args([
             "--action-id",
             "018f47a2-bbab-7de0-8000-0123456789ac",
@@ -542,6 +585,8 @@ fn never_removes_a_replacement_control_file() {
         .arg(&marker)
         .arg("--control-file")
         .arg(&control)
+        .arg("--control-identity")
+        .arg(control_identity(&control))
         .args([
             "--action-id",
             "018f47a2-bbab-7de0-8000-0123456789ac",

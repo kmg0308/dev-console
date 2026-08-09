@@ -14,12 +14,13 @@ INFO_PLIST="$APP_DIR/Contents/Info.plist"
 MAIN="$APP_DIR/Contents/MacOS/RuntimeAtlas"
 CLI="$APP_DIR/Contents/MacOS/runtime-atlas"
 SUPERVISOR="$APP_DIR/Contents/MacOS/runtime-atlas-supervisor"
+APP_HELPER="$APP_DIR/Contents/Helpers/runtime-atlas"
 
 if [[ ! -d "$APP_DIR" || -L "$APP_DIR" || ! -f "$INFO_PLIST" || -L "$INFO_PLIST" ]]; then
     echo "app input must be a regular non-symlink bundle" >&2
     exit 1
 fi
-for executable in "$MAIN" "$CLI" "$SUPERVISOR"; do
+for executable in "$MAIN" "$CLI" "$SUPERVISOR" "$APP_HELPER"; do
     if [[ ! -f "$executable" || -L "$executable" || ! -x "$executable" ]]; then
         echo "app executables must be regular non-symlink files" >&2
         exit 1
@@ -32,7 +33,7 @@ if [[ -n "${INSTALLER_SIGN_IDENTITY:-}" && "$APP_SIGN_IDENTITY" = "-" ]]; then
     echo "INSTALLER_SIGN_IDENTITY requires a Developer ID Application APP_SIGN_IDENTITY" >&2
     exit 1
 fi
-"$ROOT_DIR/scripts/verify-runtime-atlas-macos-executables.sh" "$CLI" "$SUPERVISOR"
+"$ROOT_DIR/scripts/verify-runtime-atlas-macos-executables.sh" "$CLI" "$SUPERVISOR" "$APP_HELPER"
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
 if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
@@ -66,13 +67,15 @@ fi
 for executable in \
     "$STAGED_APP/Contents/MacOS/RuntimeAtlas" \
     "$STAGED_APP/Contents/MacOS/runtime-atlas" \
-    "$STAGED_APP/Contents/MacOS/runtime-atlas-supervisor"; do
+    "$STAGED_APP/Contents/MacOS/runtime-atlas-supervisor" \
+    "$STAGED_APP/Contents/Helpers/runtime-atlas"; do
     if [[ ! -f "$executable" || -L "$executable" || ! -x "$executable" ]]; then
         echo "staged executables must be regular non-symlink files" >&2
         exit 1
     fi
 done
 codesign "${SIGN_ARGS[@]}" "$STAGED_APP/Contents/MacOS/runtime-atlas"
+install -m 0755 "$STAGED_APP/Contents/MacOS/runtime-atlas" "$STAGED_APP/Contents/Helpers/runtime-atlas"
 codesign "${SIGN_ARGS[@]}" "$STAGED_APP/Contents/MacOS/runtime-atlas-supervisor"
 codesign "${SIGN_ARGS[@]}" "$STAGED_APP"
 if [[ "$APP_SIGN_IDENTITY" != "-" ]]; then

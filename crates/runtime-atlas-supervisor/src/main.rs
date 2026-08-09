@@ -1,4 +1,10 @@
 use serde::Serialize;
+#[cfg(windows)]
+use std::{
+    ffi::OsStr,
+    mem::{offset_of, size_of},
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle},
+};
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
@@ -6,16 +12,22 @@ use std::{
     path::{Path, PathBuf},
     process,
 };
+#[cfg(unix)]
+use std::{
+    ffi::{CString, OsStr},
+    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd, io::FromRawFd},
+};
 use uuid::Uuid;
 
 const EX_USAGE: i32 = 64;
 const EX_OSERR: i32 = 71;
-const USAGE: &str = "usage: runtime-atlas-supervisor [--session-id <uuid> --session-file <absolute path> --control-file <absolute path> --action-id <uuid> --worktree <absolute path>] --cwd <absolute path> -- <executable> [args...]";
+const USAGE: &str = "usage: runtime-atlas-supervisor [--session-id <uuid> --session-file <absolute path> --control-file <absolute path> --control-identity <identity> --action-id <uuid> --worktree <absolute path>] --cwd <absolute path> -- <executable> [args...]";
 
 struct SessionSpec {
     id: Uuid,
     path: PathBuf,
     control_path: PathBuf,
+    control_identity: String,
     action_id: Uuid,
     worktree_path: PathBuf,
 }
@@ -36,16 +48,19 @@ fn parse(arguments: Vec<OsString>) -> Option<Invocation> {
         let id = arguments.get(1)?.to_str()?.parse::<Uuid>().ok()?;
         let path = Path::new(arguments.get(3)?);
         let control_path = Path::new(arguments.get(5)?);
-        let action_id = arguments.get(7)?.to_str()?.parse::<Uuid>().ok()?;
-        let worktree = Path::new(arguments.get(9)?);
+        let control_identity = arguments.get(7)?.to_str()?;
+        let action_id = arguments.get(9)?.to_str()?.parse::<Uuid>().ok()?;
+        let worktree = Path::new(arguments.get(11)?);
         if id.is_nil()
             || action_id.is_nil()
             || arguments.get(2)? != "--session-file"
             || !path.is_absolute()
             || arguments.get(4)? != "--control-file"
             || !control_path.is_absolute()
-            || arguments.get(6)? != "--action-id"
-            || arguments.get(8)? != "--worktree"
+            || arguments.get(6)? != "--control-identity"
+            || control_identity.is_empty()
+            || arguments.get(8)? != "--action-id"
+            || arguments.get(10)? != "--worktree"
             || !worktree.is_absolute()
         {
             return None;
@@ -54,11 +69,12 @@ fn parse(arguments: Vec<OsString>) -> Option<Invocation> {
         if !worktree_path.is_dir() {
             return None;
         }
-        index = 10;
+        index = 12;
         Some(SessionSpec {
             id,
             path: path.to_owned(),
             control_path: control_path.to_owned(),
+            control_identity: control_identity.to_owned(),
             action_id,
             worktree_path,
         })
@@ -99,51 +115,59 @@ struct SessionMarker<'a> {
 }
 
 struct SessionMarkerGuard {
-    path: PathBuf,
     file: File,
+    #[cfg(unix)]
+    parent: File,
+    #[cfg(windows)]
+    _parent: File,
+    #[cfg(unix)]
+    name: OsString,
 }
 
 struct ControlFileGuard {
-    path: PathBuf,
     file: File,
+    parent: File,
+    #[cfg(unix)]
+    name: OsString,
 }
 
 impl ControlFileGuard {
-    fn open(path: &Path) -> io::Result<Self> {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "control file has no parent")
-            })?;
-        let parent_metadata = fs::symlink_metadata(parent)?;
-        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+    fn open(path: &Path, expected_identity: &str) -> io::Result<Self> {
+        let (parent, name) = open_private_parent(path, "control file")?;
+        #[cfg(windows)]
+        let _ = &name;
+
+        #[cfg(unix)]
+        let file = open_at(
+            &parent,
+            &name,
+            libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )?;
+        #[cfg(windows)]
+        let file = {
+            let file = open_windows_path(path, false)?;
+            if !windows_parent_matches(&parent, path.parent().expect("validated parent"))? {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "control file parent was replaced while opening",
+                ));
+            }
+            file
+        };
+        validate_private_control_file(&file.metadata()?)?;
+        if file_identity(&file)? != expected_identity {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "control file parent must be an existing private directory",
+                "control file identity does not match the pending session",
             ));
         }
-        validate_private_parent(&parent_metadata)?;
-
-        let mut options = OpenOptions::new();
-        options.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let file = options.open(path)?;
-        validate_private_control_file(&file.metadata()?)?;
         file.lock_shared()?;
         let mut guard = Self {
-            path: path.to_owned(),
             file,
+            parent,
+            #[cfg(unix)]
+            name,
         };
         guard.file.rewind()?;
         let mut value = [0; 2];
@@ -164,36 +188,23 @@ impl ControlFileGuard {
 
 impl Drop for ControlFileGuard {
     fn drop(&mut self) {
-        if same_file(&self.file, &self.path).unwrap_or(false) {
-            let _ = fs::remove_file(&self.path);
-            if let Some(parent) = self.path.parent() {
-                let _ = sync_directory(parent);
-            }
+        #[cfg(unix)]
+        {
+            let _ = remove_at_if_same(&self.parent, &self.name, &self.file);
+            let _ = self.parent.sync_all();
         }
+        #[cfg(windows)]
+        let _ = remove_windows_file(&self.file);
     }
 }
 
 impl SessionMarkerGuard {
-    fn create(spec: &SessionSpec) -> io::Result<Self> {
-        let parent = spec
-            .path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "session file has no parent")
-            })?;
-        let parent_metadata = fs::symlink_metadata(parent)?;
-        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+    fn create(spec: &SessionSpec, control_parent: &File) -> io::Result<Self> {
+        let (parent, name) = open_private_parent(&spec.path, "session file")?;
+        if !same_file(&parent, control_parent)? {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "session file parent must be an existing private directory",
-            ));
-        }
-        validate_private_parent(&parent_metadata)?;
-        if spec.path.file_name().is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session file has no name",
+                "session marker and control file parents do not match",
             ));
         }
 
@@ -207,52 +218,227 @@ impl SessionMarkerGuard {
             start_identity: &start_identity,
         })?;
         data.push(b'\n');
-        let temporary_path = parent.join(format!(
+        let temporary_name = OsString::from(format!(
             ".runtime-atlas-session-{}-{}.tmp",
             spec.id,
             process::id()
         ));
-        let mut options = OpenOptions::new();
-        options.create_new(true).read(true).write(true);
+        #[cfg(windows)]
+        let temporary_path = spec
+            .path
+            .parent()
+            .expect("validated parent")
+            .join(&temporary_name);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary_path)?;
+        let mut file = open_at(
+            &parent,
+            &temporary_name,
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )?;
+        #[cfg(windows)]
+        let mut file = {
+            let file = open_windows_path(&temporary_path, true)?;
+            if !matches!(
+                windows_parent_matches(&parent, spec.path.parent().expect("validated parent")),
+                Ok(true)
+            ) {
+                let _ = remove_windows_file(&file);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "session file parent was replaced while creating a temporary marker",
+                ));
+            }
+            file
+        };
+        #[cfg(unix)]
         let mut linked = false;
         let result = (|| {
             file.write_all(&data)?;
             file.sync_all()?;
-            fs::hard_link(&temporary_path, &spec.path)?;
-            linked = true;
-            sync_directory(parent)?;
-            fs::remove_file(&temporary_path)?;
-            sync_directory(parent)
+            #[cfg(unix)]
+            link_at(&parent, &temporary_name, &name)?;
+            #[cfg(windows)]
+            {
+                let parent_path = spec.path.parent().expect("validated parent");
+                if !windows_parent_matches(&parent, parent_path)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "session file parent was replaced before marker publication",
+                    ));
+                }
+                rename_windows_at(&file, &parent, &name)?;
+            }
+            #[cfg(unix)]
+            {
+                linked = true;
+            }
+            #[cfg(unix)]
+            {
+                if !same_file_at(&file, &parent, &name)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "published session marker was replaced",
+                    ));
+                }
+                parent.sync_all()?;
+                if !remove_at_if_same(&parent, &temporary_name, &file)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "temporary session marker was replaced",
+                    ));
+                }
+                parent.sync_all()
+            }
+            #[cfg(windows)]
+            {
+                let parent_path = spec.path.parent().expect("validated parent");
+                if !windows_parent_matches(&parent, parent_path)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "session file parent was replaced before marker verification",
+                    ));
+                }
+                let published_file = open_windows_probe(&spec.path)?;
+                if !windows_parent_matches(&parent, parent_path)?
+                    || !same_file(&file, &published_file)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "published session marker was replaced",
+                    ));
+                }
+                Ok(())
+            }
         })();
         if let Err(error) = result {
-            let _ = fs::remove_file(&temporary_path);
-            if linked {
-                let _ = fs::remove_file(&spec.path);
+            #[cfg(unix)]
+            {
+                let _ = remove_at_if_same(&parent, &temporary_name, &file);
+                if linked {
+                    let _ = remove_at_if_same(&parent, &name, &file);
+                }
+                let _ = parent.sync_all();
             }
+            #[cfg(windows)]
+            let _ = remove_windows_file(&file);
             return Err(error);
         }
         Ok(Self {
-            path: spec.path.clone(),
             file,
+            #[cfg(unix)]
+            parent,
+            #[cfg(windows)]
+            _parent: parent,
+            #[cfg(unix)]
+            name,
         })
     }
 }
 
 impl Drop for SessionMarkerGuard {
     fn drop(&mut self) {
-        if same_file(&self.file, &self.path).unwrap_or(false) {
-            let _ = fs::remove_file(&self.path);
-            if let Some(parent) = self.path.parent() {
-                let _ = sync_directory(parent);
-            }
+        #[cfg(unix)]
+        {
+            let _ = remove_at_if_same(&self.parent, &self.name, &self.file);
+            let _ = self.parent.sync_all();
         }
+        #[cfg(windows)]
+        let _ = remove_windows_file(&self.file);
     }
+}
+
+#[cfg(unix)]
+fn open_private_parent(path: &Path, label: &str) -> io::Result<(File, OsString)> {
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} has no parent"),
+            )
+        })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{label} has no name")))?
+        .to_owned();
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let parent = options.open(parent_path)?;
+    validate_private_parent(&parent.metadata()?)?;
+    Ok((parent, name))
+}
+
+#[cfg(unix)]
+fn relative_name(name: &OsStr) -> io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file name contains NUL"))
+}
+
+#[cfg(unix)]
+fn open_at(parent: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+    let name = relative_name(name)?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            mode as libc::c_uint,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn link_at(parent: &File, source: &OsStr, destination: &OsStr) -> io::Result<()> {
+    let source = relative_name(source)?;
+    let destination = relative_name(destination)?;
+    if unsafe {
+        libc::linkat(
+            parent.as_raw_fd(),
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            destination.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_at(file: &File, parent: &File, name: &OsStr) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let path_file = open_at(
+        parent,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )?;
+    let open = file.metadata()?;
+    let path = path_file.metadata()?;
+    Ok(open.dev() == path.dev() && open.ino() == path.ino())
+}
+
+#[cfg(unix)]
+fn remove_at_if_same(parent: &File, name: &OsStr, file: &File) -> io::Result<bool> {
+    if !same_file_at(file, parent, name)? {
+        return Ok(false);
+    }
+    let name = relative_name(name)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -310,50 +496,229 @@ fn validate_private_control_file(metadata: &fs::Metadata) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn same_file(file: &File, path: &Path) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let open = file.metadata()?;
-    let path = fs::symlink_metadata(path)?;
-    Ok(open.dev() == path.dev() && open.ino() == path.ino())
+#[cfg(windows)]
+fn open_private_parent(path: &Path, label: &str) -> io::Result<(File, OsString)> {
+    let parent_path = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} has no parent"),
+            )
+        })?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("{label} has no name")))?
+        .to_owned();
+    Ok((open_windows_parent(parent_path, label)?, name))
 }
 
 #[cfg(windows)]
-fn same_file(file: &File, path: &Path) -> io::Result<bool> {
+fn open_windows_parent(path: &Path, label: &str) -> io::Result<File> {
     use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    fn identity(file: &File) -> io::Result<(u32, u64)> {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-        };
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    let parent = options.open(path)?;
+    let metadata = parent.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{label} parent must be an existing non-reparse directory"),
+        ));
+    }
+    validate_private_parent(&metadata)?;
+    Ok(parent)
+}
 
-        let mut info = BY_HANDLE_FILE_INFORMATION::default();
-        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+#[cfg(windows)]
+fn windows_parent_matches(expected: &File, path: &Path) -> io::Result<bool> {
+    open_windows_parent(path, "session file").and_then(|actual| same_file(expected, &actual))
+}
+
+#[cfg(windows)]
+fn open_windows_path(path: &Path, create_new: bool) -> io::Result<File> {
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_READ, GENERIC_WRITE},
+        Storage::FileSystem::{
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        },
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    if create_new {
+        options.create_new(true);
+    }
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn open_windows_probe(path: &Path) -> io::Result<File> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn rename_windows_at(file: &File, parent: &File, name: &OsStr) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
+    };
+
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(value)) if value == name)
+        || components.next().is_some()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session marker name must be one relative path component",
+        ));
+    }
+    let name = name.encode_wide().collect::<Vec<_>>();
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session marker name is invalid",
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session marker name is too long",
+            )
+        })?;
+    let buffer_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session marker name is too long",
+            )
+        })?;
+    let buffer_words = buffer_bytes.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0usize; buffer_words];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        info.write(FILE_RENAME_INFO::default());
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = parent.as_raw_handle() as HANDLE;
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        if SetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(buffer_bytes).map_err(io::Error::other)?,
+        ) == 0
+        {
             return Err(io::Error::last_os_error());
         }
-        Ok((
-            info.dwVolumeSerialNumber,
-            ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
-        ))
     }
-
-    if fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Ok(false);
-    }
-    let path_file = OpenOptions::new().read(true).open(path)?;
-    Ok(identity(file)? == identity(&path_file)?)
+    Ok(())
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
+fn file_identity(file: &File) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn same_file(first: &File, second: &File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let first = first.metadata()?;
+    let second = second.metadata()?;
+    Ok(first.dev() == second.dev() && first.ino() == second.ino())
 }
 
 #[cfg(windows)]
-fn sync_directory(_path: &Path) -> io::Result<()> {
+fn file_identity(file: &File) -> io::Result<String> {
+    let (volume, index) = windows_file_identity(file)?;
+    Ok(format!("windows:{volume}:{index}"))
+}
+
+#[cfg(windows)]
+fn remove_windows_file(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx,
+            SetFileInformationByHandle,
+        },
+    };
+
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as HANDLE,
+            FileDispositionInfoEx,
+            (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn same_file(first: &File, second: &File) -> io::Result<bool> {
+    Ok(windows_file_identity(first)? == windows_file_identity(second)?)
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File) -> io::Result<(u32, u64)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        info.dwVolumeSerialNumber,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    ))
 }
 
 fn main() {
@@ -375,7 +740,7 @@ fn main() {
         process::exit(EX_OSERR);
     }
     let control = match invocation.session.as_ref() {
-        Some(spec) => match ControlFileGuard::open(&spec.control_path) {
+        Some(spec) => match ControlFileGuard::open(&spec.control_path, &spec.control_identity) {
             Ok(control) => Some(control),
             Err(error) => {
                 platform::cancel(platform);
@@ -386,7 +751,13 @@ fn main() {
         None => None,
     };
     let marker = match invocation.session.take() {
-        Some(spec) => match SessionMarkerGuard::create(&spec) {
+        Some(spec) => match SessionMarkerGuard::create(
+            &spec,
+            &control
+                .as_ref()
+                .expect("managed session has control")
+                .parent,
+        ) {
             Ok(marker) => Some(marker),
             Err(error) => {
                 platform::cancel(platform);
@@ -1408,6 +1779,156 @@ mod platform {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn opened_parent_handle_confines_windows_path_replacements() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("live");
+        let original = root.path().join("original");
+        let marker_directory = live.join("markers");
+        fs::create_dir_all(&marker_directory).unwrap();
+        let marker_path = marker_directory.join("session.json");
+        let moved_marker = marker_directory.join("moved.json");
+        let (parent, marker_name) = open_private_parent(&marker_path, "session file").unwrap();
+        let temporary_name = OsStr::new("session.tmp");
+        let temporary_path = marker_directory.join(temporary_name);
+        let mut marker = open_windows_path(&temporary_path, true).unwrap();
+        assert!(windows_parent_matches(&parent, &marker_directory).unwrap());
+        marker.write_all(b"owned").unwrap();
+        rename_windows_at(&marker, &parent, &marker_name).unwrap();
+        let published = open_windows_probe(&marker_path).unwrap();
+        assert!(windows_parent_matches(&parent, &marker_directory).unwrap());
+        assert!(same_file(&marker, &published).unwrap());
+        drop(published);
+
+        assert!(fs::rename(&marker_path, &moved_marker).is_err());
+        assert!(fs::remove_file(&marker_path).is_err());
+        assert!(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&marker_path)
+                .is_err()
+        );
+        let published = open_windows_probe(&marker_path).unwrap();
+        assert!(same_file(&marker, &published).unwrap());
+        assert_eq!(fs::read(&marker_path).unwrap(), b"owned");
+        drop(published);
+
+        assert!(fs::rename(&marker_directory, live.join("replacement")).is_err());
+        remove_windows_file(&marker).unwrap();
+        drop(marker);
+        assert!(!marker_path.exists());
+
+        let final_directory = if fs::rename(&live, &original).is_ok() {
+            let replacement = live.join("markers");
+            fs::create_dir_all(&replacement).unwrap();
+            assert!(!windows_parent_matches(&parent, &replacement).unwrap());
+            let misplaced = open_windows_path(&replacement.join("misplaced.tmp"), true).unwrap();
+            remove_windows_file(&misplaced).unwrap();
+            drop(misplaced);
+            assert!(!replacement.join("misplaced.tmp").exists());
+            original.join("markers")
+        } else {
+            assert!(windows_parent_matches(&parent, &marker_directory).unwrap());
+            marker_directory
+        };
+        assert!(!final_directory.join("session.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_identity_handoff_rejects_replacement_and_blocks_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let control_path = directory.path().join("session.control");
+        let moved_path = directory.path().join("moved.control");
+        let mut host_options = OpenOptions::new();
+        host_options
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        let mut host = host_options.open(&control_path).unwrap();
+        host.write_all(&[0]).unwrap();
+        host.sync_all().unwrap();
+        host.lock_shared().unwrap();
+        let expected = file_identity(&host).unwrap();
+
+        fs::rename(&control_path, &moved_path).unwrap();
+        fs::write(&control_path, [0]).unwrap();
+        let replacement = open_windows_probe(&control_path).unwrap();
+        assert_ne!(file_identity(&replacement).unwrap(), expected);
+        assert!(ControlFileGuard::open(&control_path, &expected).is_err());
+        assert_eq!(fs::read(&control_path).unwrap(), [0]);
+        drop(replacement);
+        fs::remove_file(&control_path).unwrap();
+        fs::rename(&moved_path, &control_path).unwrap();
+
+        let guard = ControlFileGuard::open(&control_path, &expected).unwrap();
+        host.unlock().unwrap();
+        drop(host);
+        assert!(fs::rename(&control_path, &moved_path).is_err());
+        assert!(fs::remove_file(&control_path).is_err());
+        let probe = open_windows_probe(&control_path).unwrap();
+        assert_eq!(file_identity(&probe).unwrap(), expected);
+        assert_eq!(fs::read(&control_path).unwrap(), [0]);
+        drop(probe);
+        drop(guard);
+        assert!(!control_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_parent_and_inode_checks_confine_path_replacements() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let live = root.path().join("live");
+        let original = root.path().join("original");
+        fs::create_dir(&live).unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o700)).unwrap();
+        let marker_path = live.join("session.json");
+        let (parent, marker_name) = open_private_parent(&marker_path, "session file").unwrap();
+        let temporary_name = OsStr::new("session.tmp");
+        let mut marker = open_at(
+            &parent,
+            temporary_name,
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .unwrap();
+        marker.write_all(b"owned").unwrap();
+
+        fs::rename(&live, &original).unwrap();
+        fs::create_dir(&live).unwrap();
+        fs::set_permissions(&live, fs::Permissions::from_mode(0o700)).unwrap();
+        link_at(&parent, temporary_name, &marker_name).unwrap();
+        assert_eq!(fs::read(original.join(&marker_name)).unwrap(), b"owned");
+        assert!(!live.join(&marker_name).exists());
+        assert!(same_file_at(&marker, &parent, &marker_name).unwrap());
+
+        fs::remove_file(original.join(&marker_name)).unwrap();
+        fs::write(original.join(&marker_name), b"replacement").unwrap();
+        assert!(!same_file_at(&marker, &parent, &marker_name).unwrap());
+        assert!(!remove_at_if_same(&parent, &marker_name, &marker).unwrap());
+        assert_eq!(
+            fs::read(original.join(&marker_name)).unwrap(),
+            b"replacement"
+        );
+        assert!(remove_at_if_same(&parent, temporary_name, &marker).unwrap());
+    }
+
     #[test]
     fn accepts_only_the_documented_shape() {
         let directory = std::env::temp_dir().canonicalize().unwrap();
@@ -1427,6 +1948,8 @@ mod tests {
                 directory.join("session.json").into_os_string(),
                 OsString::from("--control-file"),
                 directory.join("session.control").into_os_string(),
+                OsString::from("--control-identity"),
+                OsString::from("fixture-identity"),
                 OsString::from("--action-id"),
                 OsString::from(action_id),
                 OsString::from("--worktree"),

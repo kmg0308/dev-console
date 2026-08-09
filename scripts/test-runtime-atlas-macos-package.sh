@@ -38,6 +38,13 @@ for helper in runtime-atlas runtime-atlas-supervisor; do
     grep -q 'regular non-symlink' "$TEST_DIR/failure.stderr"
 done
 
+FIXTURE="$TEST_DIR/app-helper.app"
+ditto "$APP_INPUT" "$FIXTURE"
+mv "$FIXTURE/Contents/Helpers/runtime-atlas" "$FIXTURE/Contents/Helpers/runtime-atlas.real"
+ln -s runtime-atlas.real "$FIXTURE/Contents/Helpers/runtime-atlas"
+expect_failure "$ROOT_DIR/scripts/package-runtime-atlas-macos.sh" "$FIXTURE" "$TEST_DIR/app-helper.pkg"
+grep -q 'regular non-symlink' "$TEST_DIR/failure.stderr"
+
 cat > "$TEST_DIR/component.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,11 +71,42 @@ for helper in runtime-atlas runtime-atlas-supervisor; do
     grep -q 'regular non-symlink' "$TEST_DIR/failure.stderr"
 done
 
+pkgutil --expand-full "$TEST_DIR/RuntimeAtlas.pkg" "$TEST_DIR/app-helper-expanded" >/dev/null
+PAYLOAD_HELPER="$TEST_DIR/app-helper-expanded/Payload/Applications/RuntimeAtlas.app/Contents/Helpers/runtime-atlas"
+mv "$PAYLOAD_HELPER" "$PAYLOAD_HELPER.real"
+ln -s runtime-atlas.real "$PAYLOAD_HELPER"
+pkgbuild \
+    --root "$TEST_DIR/app-helper-expanded/Payload" \
+    --component-plist "$TEST_DIR/component.plist" \
+    --install-location / \
+    --identifier com.kmg0308.runtimeatlas.pkg \
+    --version "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$TEST_DIR/app-helper-expanded/Payload/Applications/RuntimeAtlas.app/Contents/Info.plist")" \
+    "$TEST_DIR/app-helper-symlink.pkg" >/dev/null
+expect_failure "$ROOT_DIR/scripts/verify-runtime-atlas-macos-package.sh" "$TEST_DIR/app-helper-symlink.pkg" unsigned none
+grep -q 'regular non-symlink' "$TEST_DIR/failure.stderr"
+
+pkgutil --expand-full "$TEST_DIR/RuntimeAtlas.pkg" "$TEST_DIR/app-helper-mismatch-expanded" >/dev/null
+MISMATCH_PAYLOAD="$TEST_DIR/app-helper-mismatch-expanded/Payload"
+MISMATCH_APP="$MISMATCH_PAYLOAD/Applications/RuntimeAtlas.app"
+install -m 0755 "$MISMATCH_APP/Contents/MacOS/runtime-atlas-supervisor" "$MISMATCH_APP/Contents/Helpers/runtime-atlas"
+codesign --force --sign - "$MISMATCH_APP/Contents/Helpers/runtime-atlas"
+codesign --force --sign - "$MISMATCH_APP"
+pkgbuild \
+    --root "$MISMATCH_PAYLOAD" \
+    --component-plist "$TEST_DIR/component.plist" \
+    --install-location / \
+    --identifier com.kmg0308.runtimeatlas.pkg \
+    --version "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$MISMATCH_APP/Contents/Info.plist")" \
+    "$TEST_DIR/app-helper-mismatch.pkg" >/dev/null
+expect_failure "$ROOT_DIR/scripts/verify-runtime-atlas-macos-package.sh" "$TEST_DIR/app-helper-mismatch.pkg" unsigned none
+grep -q 'app helper must exactly match' "$TEST_DIR/failure.stderr"
+
 pkgutil --expand-full "$TEST_DIR/RuntimeAtlas.pkg" "$TEST_DIR/swap-expanded" >/dev/null
 SWAP_PAYLOAD="$TEST_DIR/swap-expanded/Payload"
 SWAP_APP="$SWAP_PAYLOAD/Applications/RuntimeAtlas.app"
 install -m 0755 "$SWAP_APP/Contents/MacOS/runtime-atlas-supervisor" "$SWAP_APP/Contents/MacOS/runtime-atlas"
 codesign --force --sign - "$SWAP_APP/Contents/MacOS/runtime-atlas"
+install -m 0755 "$SWAP_APP/Contents/MacOS/runtime-atlas" "$SWAP_APP/Contents/Helpers/runtime-atlas"
 install -m 0755 "$SWAP_APP/Contents/MacOS/runtime-atlas" "$SWAP_PAYLOAD/usr/local/bin/runtime-atlas"
 codesign --force --sign - "$SWAP_APP"
 pkgbuild \

@@ -166,6 +166,10 @@ export const runtimeAtlasCommands = {
     invoke<string | null>("runtime_atlas_advance_worktree_navigation", { currentPath, forward }),
   commitWorktreeNavigation: () =>
     invoke<void>("runtime_atlas_commit_worktree_navigation"),
+  cancelWorktreeNavigation: () =>
+    invoke<void>("runtime_atlas_cancel_worktree_navigation"),
   recordWorktreeSelection: (path: string) =>
     invoke<void>("runtime_atlas_record_worktree_selection", { path }),
+  openWorktreeInVsCode: (path: string) =>
+    invoke<void>("runtime_atlas_open_worktree_in_vscode", { path }),
 };

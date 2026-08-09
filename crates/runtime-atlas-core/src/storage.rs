@@ -734,6 +734,13 @@ impl ActionSessionRecord {
         self.control_identity.as_deref()
     }
 
+    pub fn is_unlinked_legacy(&self) -> bool {
+        !self.pending
+            && self.supervisor_identity.is_none()
+            && self.marker_identity.is_none()
+            && self.control_identity.is_none()
+    }
+
     pub fn link_state(
         &self,
         observed_supervisor: &ProcessIdentity,
@@ -1154,6 +1161,7 @@ mod tests {
             record.link_state(&supervisor, "file:1:2", directory.path().join(".")),
             ActionSessionLinkState::Verified
         );
+        assert!(!record.is_unlinked_legacy());
         assert_eq!(
             record.link_state(
                 &ProcessIdentity {
@@ -1181,6 +1189,7 @@ mod tests {
             legacy.link_state(&supervisor, "file:1:2", directory.path()),
             ActionSessionLinkState::UnlinkedLegacy
         );
+        assert!(legacy.is_unlinked_legacy());
         let pending =
             ActionSessionRecord::pending(Uuid::new_v4(), Uuid::new_v4(), directory.path()).unwrap();
         assert!(pending.is_pending());

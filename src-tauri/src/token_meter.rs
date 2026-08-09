@@ -31,11 +31,10 @@ pub struct TokenMeterState {
     cleanup_plan: Mutex<Option<PendingCleanup>>,
     data_dir: PathBuf,
     source_isolation_root: Option<PathBuf>,
-    #[cfg(target_os = "macos")]
     home_dir: PathBuf,
     legacy_preferences: Option<PathBuf>,
     codex_home_env: Option<PathBuf>,
-    account_executable: OsString,
+    account_executable: Option<OsString>,
     local_device_name: String,
 }
 
@@ -75,14 +74,17 @@ pub struct CleanupApplyResult {
 
 pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, String> {
     let identifier = &app.config().identifier;
-    #[cfg(target_os = "macos")]
     let home_dir = app.path().home_dir().map_err(|error| error.to_string())?;
     let local_data_dir = app
         .path()
         .local_data_dir()
         .map_err(|error| error.to_string())?;
     let isolated_data_dir = updater_qa_data_directory(identifier)?;
-    if isolated_data_dir.as_ref() == Some(&local_data_dir.join("TokenMeter")) {
+    let is_updater_qa = isolated_data_dir.is_some();
+    if isolated_data_dir
+        .as_ref()
+        .is_some_and(|path| crate::platform_paths_equal(path, &local_data_dir.join("TokenMeter")))
+    {
         return Err("Updater QA local data isolation is unavailable".to_owned());
     }
     let data_dir = isolated_data_dir
@@ -104,9 +106,8 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, Str
         legacy_preferences: None,
         codex_home_env: std::env::var_os("CODEX_HOME")
             .map(PathBuf::from)
-            .filter(|path| path.is_absolute() && !crate::is_token_meter_updater_qa(identifier)),
-        account_executable: OsString::from("codex"),
-        #[cfg(target_os = "macos")]
+            .filter(|path| path.is_absolute() && !is_updater_qa),
+        account_executable: None,
         home_dir,
         local_device_name: local_device_name(),
     };
@@ -115,6 +116,9 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, Str
 }
 
 pub(crate) fn updater_qa_data_directory(identifier: &str) -> Result<Option<PathBuf>, String> {
+    if let Some(root) = crate::windows_updater_qa_root(identifier)? {
+        return Ok(Some(root.join("TokenMeter")));
+    }
     isolated_data_directory(
         identifier,
         option_env!("TOKEN_METER_UPDATER_QA_ROOT").map(PathBuf::from),
@@ -294,7 +298,7 @@ impl TokenMeterState {
                 "Codex account access is disabled in updater QA.".to_owned(),
             )
         } else {
-            fetch_codex_account_usage(self.account_executable(&settings), Duration::from_secs(5))
+            fetch_codex_account_usage(self.account_executable(&settings), Duration::from_secs(15))
                 .map(DashboardAccountState::Available)
                 .unwrap_or_else(|_| {
                     DashboardAccountState::Unavailable(
@@ -394,15 +398,7 @@ impl TokenMeterState {
     }
 
     fn default_source_path(&self, relative: &str) -> Option<PathBuf> {
-        #[cfg(target_os = "macos")]
-        {
-            Some(self.home_dir.join(relative))
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = relative;
-            None
-        }
+        Some(self.home_dir.join(relative))
     }
 
     fn cleanup_preview(&self, retention_days: u32) -> Result<CleanupPreviewResult, String> {
@@ -521,12 +517,12 @@ impl TokenMeterState {
         }
     }
 
-    fn account_executable<'a>(&'a self, settings: &'a TokenMeterSettings) -> &'a OsStr {
+    fn account_executable<'a>(&'a self, settings: &'a TokenMeterSettings) -> Option<&'a OsStr> {
         settings
             .codex_executable_path
             .as_deref()
             .map(OsStr::new)
-            .unwrap_or(&self.account_executable)
+            .or(self.account_executable.as_deref())
     }
 }
 
@@ -831,13 +827,30 @@ mod tests {
             cleanup_plan: Mutex::new(None),
             data_dir: root.join("TokenMeter"),
             source_isolation_root: None,
-            #[cfg(target_os = "macos")]
             home_dir: root.join("home"),
             legacy_preferences: None,
             codex_home_env: None,
-            account_executable: root.join("missing-codex").into_os_string(),
+            account_executable: Some(root.join("missing-codex").into_os_string()),
             local_device_name: "Test device".into(),
         }
+    }
+
+    #[test]
+    fn blank_source_paths_use_the_verified_home_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let settings = state.load_settings().unwrap();
+        let home = directory.path().join("home");
+        let roots = state.scanner_roots(&settings);
+
+        assert_eq!(state.codex_home(&settings), Some(home.join(".codex")));
+        assert_eq!(roots.codex_sessions, Some(home.join(".codex/sessions")));
+        assert_eq!(
+            roots.codex_archive,
+            Some(home.join(".codex/archived_sessions"))
+        );
+        assert_eq!(roots.claude_projects, Some(home.join(".claude/projects")));
+        assert_eq!(roots.hermes_database, Some(home.join(".hermes/state.db")));
     }
 
     #[test]
@@ -1019,10 +1032,13 @@ mod tests {
         let mut settings = state.load_settings().unwrap();
         assert_eq!(
             state.account_executable(&settings),
-            state.account_executable.as_os_str()
+            state.account_executable.as_deref()
         );
         settings.codex_executable_path = stored;
-        assert_eq!(state.account_executable(&settings), OsStr::new(&stable));
+        assert_eq!(
+            state.account_executable(&settings),
+            Some(OsStr::new(&stable))
+        );
     }
 
     #[test]

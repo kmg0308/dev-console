@@ -2695,7 +2695,9 @@ name = "runtime-atlas-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "core-foundation",
  "libc",
+ "security-framework",
  "serde",
  "serde_json",
  "tempfile",

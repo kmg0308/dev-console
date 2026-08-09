@@ -340,6 +340,7 @@ fn install_runtime_atlas_macos_update(
         expected_new_cli_identifier: &new_cli_identity.identifier,
         expected_version,
         fail_after_cli_for_test: false,
+        fail_cleanup_for_test: false,
     })
     .map_err(|error| format!("Runtime Atlas app and CLI update transaction failed: {error}"))?;
     app.cleanup_before_exit();
@@ -483,6 +484,7 @@ struct RuntimeAtlasInstallTransaction<'a> {
     expected_new_cli_identifier: &'a str,
     expected_version: &'a str,
     fail_after_cli_for_test: bool,
+    fail_cleanup_for_test: bool,
 }
 
 #[cfg(all(target_os = "macos", feature = "runtime-atlas"))]
@@ -502,6 +504,7 @@ fn run_runtime_atlas_install_transaction(
         expected_new_cli_identifier,
         expected_version,
         fail_after_cli_for_test,
+        fail_cleanup_for_test,
     } = transaction;
 
     const SCRIPT: &str = r#"#!/bin/zsh
@@ -521,14 +524,23 @@ EXPECTED_NEW_CLI_IDENTIFIER="${12}"
 EXPECTED_TARGET_CLI_IDENTIFIER="${13}"
 EXPECTED_TARGET_CLI_TEAM="${14}"
 EXPECTED_VERSION="${15}"
+FAIL_CLEANUP_FOR_TEST="${16}"
 SUCCESS=0
 APP_REPLACED=0
 CLI_REPLACED=0
+APP_BACKUP_REMOVED=0
+CLI_BACKUP_REMOVED=0
 
 rollback() {
   local exit_code=$?
   local rollback_failed=0
-  if [[ "$SUCCESS" == "0" ]]; then
+  local cleanup_incomplete=0
+  local can_rollback=1
+  if [[ "$SUCCESS" == "0" && ( "$APP_BACKUP_REMOVED" == "1" || "$CLI_BACKUP_REMOVED" == "1" ) ]]; then
+    can_rollback=0
+    cleanup_incomplete=1
+  fi
+  if [[ "$SUCCESS" == "0" && "$can_rollback" == "1" ]]; then
     if [[ "$CLI_REPLACED" == "1" ]]; then
       if [[ -f "$OLD_CLI" && ! -L "$OLD_CLI" ]]; then
         /bin/rm -f "$TARGET_CLI" || rollback_failed=1
@@ -549,7 +561,10 @@ rollback() {
   /bin/rm -rf "$STAGED_APP" || rollback_failed=1
   /bin/rm -f "$STAGED_CLI" || rollback_failed=1
   if [[ "$CLI_REPLACED" == "0" ]]; then /bin/rm -f "$OLD_CLI" || rollback_failed=1; fi
-  if [[ "$SUCCESS" == "0" && "$rollback_failed" == "0" ]]; then
+  if [[ "$cleanup_incomplete" == "1" ]]; then
+    /bin/echo "backup cleanup incomplete; updated app and CLI remain synchronized; manual removal is required" >&2
+    exit 92
+  elif [[ "$SUCCESS" == "0" && "$rollback_failed" == "0" ]]; then
     /bin/echo "rollback completed" >&2
   elif [[ "$rollback_failed" == "1" ]]; then
     /bin/echo "rollback incomplete; manual repair is required" >&2
@@ -618,9 +633,21 @@ else
   [[ ! -e "$TARGET_CLI" && ! -L "$TARGET_CLI" ]]
 fi
 
+/bin/rm -rf "$OLD_APP"
+[[ ! -e "$OLD_APP" && ! -L "$OLD_APP" ]]
+APP_BACKUP_REMOVED=1
+if [[ "$FAIL_CLEANUP_FOR_TEST" == "1" ]]; then
+  /bin/echo "simulated cleanup failure" >&2
+  exit 92
+fi
+if [[ "$UPDATE_CLI" == "1" ]]; then
+  /bin/rm -f "$OLD_CLI"
+  [[ ! -e "$OLD_CLI" && ! -L "$OLD_CLI" ]]
+  CLI_BACKUP_REMOVED=1
+fi
+[[ ! -e "$OLD_APP" && ! -L "$OLD_APP" ]]
+[[ ! -e "$OLD_CLI" && ! -L "$OLD_CLI" ]]
 SUCCESS=1
-/bin/rm -rf "$OLD_APP" || true
-/bin/rm -f "$OLD_CLI" || true
 "#;
 
     let suffix = uuid::Uuid::new_v4().simple().to_string();
@@ -674,6 +701,7 @@ SUCCESS=1
                 .map_or("", |identity| identity.team.as_deref().unwrap_or("not set")),
         ),
         std::ffi::OsStr::new(expected_version),
+        std::ffi::OsStr::new(if fail_cleanup_for_test { "1" } else { "0" }),
     ];
 
     let needs_admin = !path_is_writable(target_parent)
@@ -1061,6 +1089,7 @@ mod tests {
             expected_new_cli_identifier: &new_cli_identity.identifier,
             expected_version: "1.2.3",
             fail_after_cli_for_test: true,
+            fail_cleanup_for_test: false,
         });
         assert!(failed.unwrap_err().contains("rollback completed"));
         assert_eq!(
@@ -1069,16 +1098,53 @@ mod tests {
         );
         assert_eq!(std::fs::read(&target_cli).unwrap(), old_cli);
 
+        let cleanup_failed =
+            run_runtime_atlas_install_transaction(RuntimeAtlasInstallTransaction {
+                target_app: &target_app,
+                new_app: &new_app,
+                target_cli: &target_cli,
+                new_cli: &new_cli,
+                target_cli_identity: Some(&target_cli_identity),
+                expected_team: "not set",
+                expected_new_cli_identifier: &new_cli_identity.identifier,
+                expected_version: "1.2.3",
+                fail_after_cli_for_test: false,
+                fail_cleanup_for_test: true,
+            })
+            .unwrap_err();
+        assert!(cleanup_failed.contains("simulated cleanup failure"));
+        assert!(cleanup_failed.contains("backup cleanup incomplete"));
+        assert!(cleanup_failed.contains("manual removal is required"));
+        assert_eq!(
+            std::fs::read_to_string(target_app.join("Contents/Resources/version")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::read(&target_cli).unwrap(),
+            std::fs::read(&new_cli).unwrap()
+        );
+        let old_cli_backup = std::fs::read_dir(target_cli.parent().unwrap())
+            .unwrap()
+            .map(Result::unwrap)
+            .find(|entry| entry.file_name().to_string_lossy().contains(".old."))
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(&old_cli_backup).unwrap(), old_cli);
+        std::fs::remove_file(old_cli_backup).unwrap();
+
+        let installed_cli_identity = code_identity(&target_cli).unwrap();
+
         run_runtime_atlas_install_transaction(RuntimeAtlasInstallTransaction {
             target_app: &target_app,
             new_app: &new_app,
             target_cli: &target_cli,
             new_cli: &new_cli,
-            target_cli_identity: Some(&target_cli_identity),
+            target_cli_identity: Some(&installed_cli_identity),
             expected_team: "not set",
             expected_new_cli_identifier: &new_cli_identity.identifier,
             expected_version: "1.2.3",
             fail_after_cli_for_test: false,
+            fail_cleanup_for_test: false,
         })
         .unwrap();
         assert_eq!(

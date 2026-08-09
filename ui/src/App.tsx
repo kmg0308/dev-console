@@ -28,6 +28,7 @@ export function App() {
   const [updateBusy, setUpdateBusy] = useState(false);
   const updateBusyRef = useRef(false);
   const controlQ = useRef(false);
+  const consumedQ = useRef(false);
   const consumedTab = useRef(false);
 
   useEffect(() => {
@@ -73,17 +74,28 @@ export function App() {
       controlQ.current = false;
       window.dispatchEvent(new Event("runtime-atlas:commit-worktree-navigation"));
     };
+    const cancelWorktreeNavigation = () => {
+      controlQ.current = false;
+      consumedQ.current = false;
+      consumedTab.current = false;
+      window.dispatchEvent(new Event("runtime-atlas:cancel-worktree-navigation"));
+    };
     const keyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
-      if (key === "q" && event.ctrlKey) {
+      if (key === "q" && consumedQ.current) {
+        event.preventDefault();
+        return;
+      }
+      if (key === "q" && event.ctrlKey && selected === "runtimeAtlas") {
         controlQ.current = true;
+        consumedQ.current = true;
         event.preventDefault();
         return;
       }
       if (key !== "tab" || !event.ctrlKey) return;
-      consumedTab.current = true;
-      event.preventDefault();
       if (controlQ.current) {
+        consumedTab.current = true;
+        event.preventDefault();
         if (selected === "runtimeAtlas") {
           window.dispatchEvent(new CustomEvent("runtime-atlas:advance-worktree-navigation", {
             detail: { forward: !event.shiftKey },
@@ -92,13 +104,28 @@ export function App() {
         return;
       }
       if (identity.features.length < 2) return;
+      consumedTab.current = true;
+      event.preventDefault();
       const current = identity.features.indexOf(selected);
       const offset = event.shiftKey ? identity.features.length - 1 : 1;
-      setSelected(identity.features[(current + offset) % identity.features.length]);
+      const next = identity.features[(current + offset) % identity.features.length];
+      if (selected === "runtimeAtlas" && next !== selected) {
+        window.dispatchEvent(new Event("runtime-atlas:cancel-worktree-navigation"));
+      }
+      setSelected(next);
     };
     const keyUp = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
-      if (key === "q" || key === "control") commitWorktreeNavigation();
+      if (key === "q" && consumedQ.current) {
+        commitWorktreeNavigation();
+        consumedQ.current = false;
+        event.preventDefault();
+        return;
+      }
+      if (key === "control" && controlQ.current) {
+        commitWorktreeNavigation();
+        event.preventDefault();
+      }
       if (key === "tab" && consumedTab.current) {
         consumedTab.current = false;
         event.preventDefault();
@@ -106,13 +133,24 @@ export function App() {
     };
     window.addEventListener("keydown", keyDown);
     window.addEventListener("keyup", keyUp);
-    window.addEventListener("blur", commitWorktreeNavigation);
+    window.addEventListener("blur", cancelWorktreeNavigation);
     return () => {
       window.removeEventListener("keydown", keyDown);
       window.removeEventListener("keyup", keyUp);
-      window.removeEventListener("blur", commitWorktreeNavigation);
+      window.removeEventListener("blur", cancelWorktreeNavigation);
+      cancelWorktreeNavigation();
     };
   }, [identity, selected]);
+
+  const selectFeature = (feature: Feature) => {
+    if (selected === "runtimeAtlas" && feature !== selected) {
+      controlQ.current = false;
+      consumedQ.current = false;
+      consumedTab.current = false;
+      window.dispatchEvent(new Event("runtime-atlas:cancel-worktree-navigation"));
+    }
+    setSelected(feature);
+  };
 
   const runUpdateAction = async () => {
     updateBusyRef.current = true;
@@ -158,7 +196,7 @@ export function App() {
                   aria-current={selected === feature ? "page" : undefined}
                   className={selected === feature ? "selected" : undefined}
                   key={feature}
-                  onClick={() => setSelected(feature)}
+                  onClick={() => selectFeature(feature)}
                   type="button"
                 >
                   {feature === "tokenMeter" ? "TokenMeter" : "Runtime Atlas"}
@@ -188,7 +226,16 @@ export function App() {
           </div>
         </div>
       </header>
-      {selected === "tokenMeter" ? <TokenMeter /> : <RuntimeAtlas />}
+      {identity.features.includes("tokenMeter") && (
+        <div hidden={selected !== "tokenMeter"} aria-hidden={selected !== "tokenMeter"}>
+          <TokenMeter />
+        </div>
+      )}
+      {identity.features.includes("runtimeAtlas") && (
+        <div hidden={selected !== "runtimeAtlas"} aria-hidden={selected !== "runtimeAtlas"}>
+          <RuntimeAtlas />
+        </div>
+      )}
     </main>
   );
 }

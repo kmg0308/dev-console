@@ -42,6 +42,7 @@ pub enum DashboardAccountState {
 pub struct DashboardSnapshot {
     pub generated_at: DateTime<Utc>,
     pub selection: DashboardSelection,
+    pub session_count: usize,
     pub total: TokenUsage,
     pub previous_total: TokenUsage,
     pub change_percent: Option<f64>,
@@ -199,6 +200,11 @@ where
         filters.device.as_deref(),
     ));
     let total = aggregation::total_usage(&filtered);
+    let session_count = filtered
+        .iter()
+        .map(|event| &event.session_id)
+        .collect::<BTreeSet<_>>()
+        .len();
     let buckets = dashboard_buckets(&filtered, range, bucket, interval, timezone, first_weekday);
     let projects = rows(&filtered, |event| &event.project_path, 12);
     let models = rows(&filtered, |event| &event.model, 12);
@@ -221,6 +227,7 @@ where
             bucket: request.bucket.clone(),
             filters,
         },
+        session_count,
         total,
         previous_total,
         change_percent: change_percent(total.total, previous_total.total),
@@ -517,6 +524,7 @@ impl From<&CodexRateLimitWindow> for DashboardRateLimitWindow {
 pub struct DashboardSnapshotDto {
     pub generated_at: DateTime<Utc>,
     pub selection: DashboardSelection,
+    pub session_count: usize,
     pub total: WireTokenUsage,
     pub previous_total: WireTokenUsage,
     pub change_percent: Option<f64>,
@@ -572,6 +580,7 @@ impl From<DashboardSnapshot> for DashboardSnapshotDto {
         Self {
             generated_at: snapshot.generated_at,
             selection: snapshot.selection,
+            session_count: snapshot.session_count,
             total: snapshot.total.into(),
             previous_total: snapshot.previous_total.into(),
             change_percent: snapshot.change_percent,
@@ -753,12 +762,46 @@ mod tests {
             }
         );
         assert_eq!(snapshot.total.total, 20);
+        assert_eq!(snapshot.session_count, 1);
         assert_eq!(snapshot.previous_total.total, 10);
         assert_eq!(snapshot.change_percent, Some(100.0));
         assert_eq!(snapshot.buckets.len(), 2);
         assert_eq!(snapshot.buckets[0].start, at(11, 0));
         assert_eq!(snapshot.buckets[0].end, at(11, 30));
         assert_eq!(snapshot.buckets[1].end, at(12, 0));
+    }
+
+    #[test]
+    fn session_count_is_not_limited_to_the_session_rows() {
+        let now = at(12, 0);
+        let scan = ScanResult {
+            events: (0..21)
+                .map(|index| {
+                    event(
+                        &format!("session-{index}"),
+                        now - Duration::minutes(1),
+                        "project",
+                        "model",
+                        1,
+                    )
+                })
+                .collect(),
+            ..ScanResult::default()
+        };
+        let snapshot = compose_dashboard(
+            &request("1h", "30m"),
+            &scan,
+            &settings(),
+            "This Mac",
+            None,
+            now,
+            &FixedOffset::east_opt(0).unwrap(),
+            Weekday::Mon,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.groups.sessions.len(), 20);
+        assert_eq!(snapshot.session_count, 21);
     }
 
     #[test]
@@ -771,6 +814,7 @@ mod tests {
                 bucket: "auto".into(),
                 filters: DashboardFilters::default(),
             },
+            session_count: usize::MAX,
             total: TokenUsage::new(
                 i64::MAX,
                 i64::MAX,
@@ -808,6 +852,7 @@ mod tests {
             },
         };
         let json = serde_json::to_value(DashboardSnapshotDto::from(snapshot)).unwrap();
+        assert_eq!(json["sessionCount"], usize::MAX);
         for field in [
             "input",
             "cachedInput",

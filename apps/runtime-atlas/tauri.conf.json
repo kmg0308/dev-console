@@ -33,6 +33,9 @@
       "icons/runtime-atlas.ico"
     ],
     "macOS": {
+      "files": {
+        "Helpers/runtime-atlas": "binaries/runtime-atlas-app-helper"
+      },
       "infoPlist": "../apps/runtime-atlas/Info.plist"
     }
   }

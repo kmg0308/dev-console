@@ -1,6 +1,9 @@
-use std::path::Path;
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::command::output as command_output;
 use crate::models::{
     AtlasNotice, AtlasNoticeKind, AvailabilityState, DiscoveryAvailability, RuntimeContainer,
 };
@@ -32,6 +35,249 @@ pub fn observe_process_ancestry(process: &ProcessIdentity) -> Option<Vec<Process
         return None;
     }
     platform::observe_process_ancestry(process)
+}
+
+pub fn resolve_docker_executable() -> Option<PathBuf> {
+    resolve_executable_in_path(
+        std::env::var_os("PATH").as_deref(),
+        OsStr::new(if cfg!(windows) {
+            "docker.exe"
+        } else {
+            "docker"
+        }),
+    )
+    .or_else(docker_platform::registered_executable)
+}
+
+fn resolve_executable_in_path(path: Option<&OsStr>, name: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path?).find_map(|directory| {
+        let executable = fs::canonicalize(directory.join(name)).ok()?;
+        is_regular_executable(&executable).then_some(executable)
+    })
+}
+
+fn is_regular_executable(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn docker_from_registered_bundles(bundles: &[PathBuf]) -> Option<PathBuf> {
+    let [bundle] = bundles else {
+        return None;
+    };
+    let bundle = fs::canonicalize(bundle).ok()?;
+    if !fs::symlink_metadata(&bundle).ok()?.file_type().is_dir() {
+        return None;
+    }
+    let candidate = bundle.join("Contents/Resources/bin/docker");
+    if !is_regular_executable(&candidate) {
+        return None;
+    }
+    let executable = fs::canonicalize(candidate).ok()?;
+    executable.starts_with(&bundle).then_some(executable)
+}
+
+#[cfg(target_os = "macos")]
+mod docker_platform {
+    use std::ffi::{c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+
+    use super::*;
+
+    const UTF8: u32 = 0x0800_0100;
+
+    pub(super) fn registered_executable() -> Option<PathBuf> {
+        docker_from_registered_bundles(&application_urls()?)
+    }
+
+    fn application_urls() -> Option<Vec<PathBuf>> {
+        // SAFETY: The bundle identifier is a static NUL-terminated UTF-8 string.
+        let identifier = unsafe {
+            CFStringCreateWithCString(std::ptr::null(), c"com.docker.docker".as_ptr(), UTF8)
+        };
+        if identifier.is_null() {
+            return None;
+        }
+        let mut error = std::ptr::null();
+        // SAFETY: `identifier` is a live CFString and `error` is writable.
+        let urls = unsafe { LSCopyApplicationURLsForBundleIdentifier(identifier, &mut error) };
+        // SAFETY: The create function returned this owned Core Foundation object.
+        unsafe { CFRelease(identifier) };
+        if !error.is_null() {
+            // SAFETY: LaunchServices returned this owned error object.
+            unsafe { CFRelease(error) };
+            if !urls.is_null() {
+                // SAFETY: LaunchServices returned this owned array object.
+                unsafe { CFRelease(urls) };
+            }
+            return None;
+        }
+        if urls.is_null() {
+            return None;
+        }
+
+        let paths = (|| {
+            // SAFETY: `urls` remains live until after this closure.
+            let count = unsafe { CFArrayGetCount(urls) };
+            let mut paths = Vec::with_capacity(usize::try_from(count).ok()?);
+            for index in 0..count {
+                // SAFETY: `index` is within the array count.
+                let url = unsafe { CFArrayGetValueAtIndex(urls, index) };
+                if url.is_null() {
+                    return None;
+                }
+                let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
+                // SAFETY: `url` comes from the live array and `buffer` is writable for its length.
+                if unsafe {
+                    CFURLGetFileSystemRepresentation(
+                        url,
+                        1,
+                        buffer.as_mut_ptr(),
+                        buffer.len() as isize,
+                    )
+                } == 0
+                {
+                    return None;
+                }
+                let length = buffer.iter().position(|byte| *byte == 0)?;
+                paths.push(PathBuf::from(OsStr::from_bytes(&buffer[..length])));
+            }
+            Some(paths)
+        })();
+        // SAFETY: LaunchServices returned this owned array object.
+        unsafe { CFRelease(urls) };
+        paths
+    }
+
+    #[link(name = "CoreServices", kind = "framework")]
+    unsafe extern "C" {
+        fn LSCopyApplicationURLsForBundleIdentifier(
+            bundle_identifier: *const c_void,
+            error: *mut *const c_void,
+        ) -> *const c_void;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            allocator: *const c_void,
+            string: *const c_char,
+            encoding: u32,
+        ) -> *const c_void;
+        fn CFArrayGetCount(array: *const c_void) -> isize;
+        fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        fn CFURLGetFileSystemRepresentation(
+            url: *const c_void,
+            resolve_against_base: u8,
+            buffer: *mut u8,
+            maximum_length: isize,
+        ) -> u8;
+        fn CFRelease(value: *const c_void);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod docker_platform {
+    use super::*;
+
+    pub(super) fn registered_executable() -> Option<PathBuf> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod docker_resolver_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn make_executable(path: &Path) {
+        fs::write(path, b"fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn inherited_path_resolves_only_the_first_exact_regular_executable() {
+        let temporary = tempdir().unwrap();
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let name = OsStr::new(if cfg!(windows) {
+            "docker.exe"
+        } else {
+            "docker"
+        });
+        fs::create_dir(first.join(name)).unwrap();
+        let expected = second.join(name);
+        make_executable(&expected);
+        fs::write(second.join("docker-helper"), b"fixture").unwrap();
+        let path = std::env::join_paths([first, second]).unwrap();
+
+        assert_eq!(
+            resolve_executable_in_path(Some(&path), name),
+            Some(fs::canonicalize(expected).unwrap())
+        );
+        assert_eq!(
+            resolve_executable_in_path(Some(&path), OsStr::new("missing-docker")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registered_bundle_requires_one_app_with_its_regular_docker_executable() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().unwrap();
+        let bundle = temporary.path().join("Docker.app");
+        let executable = bundle.join("Contents/Resources/bin/docker");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        make_executable(&executable);
+
+        assert_eq!(
+            docker_from_registered_bundles(std::slice::from_ref(&bundle)),
+            Some(fs::canonicalize(executable).unwrap())
+        );
+        assert_eq!(
+            docker_from_registered_bundles(&[bundle.clone(), bundle]),
+            None
+        );
+
+        let escaped_bundle = temporary.path().join("Escaped.app");
+        let external = temporary.path().join("external");
+        fs::create_dir_all(escaped_bundle.join("Contents")).unwrap();
+        fs::create_dir_all(external.join("bin")).unwrap();
+        make_executable(&external.join("bin/docker"));
+        symlink(&external, escaped_bundle.join("Contents/Resources")).unwrap();
+        assert_eq!(docker_from_registered_bundles(&[escaped_bundle]), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launch_services_docker_is_installed_or_absent() {
+        if let Some(executable) = docker_platform::registered_executable() {
+            assert!(is_regular_executable(&executable));
+            assert!(executable.ends_with("Contents/Resources/bin/docker"));
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,20 +323,24 @@ pub fn observe_docker(executable: Option<&Path>) -> DockerObservation {
         };
     };
 
-    match Command::new(executable)
-        .args(["info", "--format", "{{.ServerVersion}}"])
-        .output()
-    {
+    let mut info = Command::new(executable);
+    info.args(["info", "--format", "{{.ServerVersion}}"]);
+    match command_output(&mut info) {
         Ok(output) if output.status.success() => {}
         Ok(_) => return docker_unavailable("Docker daemon is not responding."),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return docker_unavailable("Docker daemon inspection timed out.");
+        }
         Err(_) => return docker_unavailable("Docker executable could not be launched."),
     }
 
-    let listing = match Command::new(executable)
-        .args(["ps", "--quiet", "--no-trunc"])
-        .output()
-    {
+    let mut list = Command::new(executable);
+    list.args(["ps", "--quiet", "--no-trunc"]);
+    let listing = match command_output(&mut list) {
         Ok(output) if output.status.success() => output,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return docker_unavailable("Docker container listing timed out.");
+        }
         Ok(_) | Err(_) => return docker_unavailable("Docker containers could not be read."),
     };
     let Ok(listing) = std::str::from_utf8(&listing.stdout) else {
@@ -110,12 +360,13 @@ pub fn observe_docker(executable: Option<&Path>) -> DockerObservation {
         };
     }
 
-    let inspection = match Command::new(executable)
-        .arg("inspect")
-        .args(&identifiers)
-        .output()
-    {
+    let mut inspect = Command::new(executable);
+    inspect.arg("inspect").args(&identifiers);
+    let inspection = match command_output(&mut inspect) {
         Ok(output) if output.status.success() => output,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return docker_unavailable("Docker container inspection timed out.");
+        }
         Ok(_) | Err(_) => {
             return docker_unavailable("Docker container details could not be read.");
         }
@@ -178,6 +429,7 @@ mod platform {
     use std::mem::{MaybeUninit, size_of};
     use std::process::Command;
 
+    use crate::command::output as command_output;
     use crate::models::{DiscoveryAvailability, RuntimeProcess};
     use crate::relations::{ObservedProcess, ProcessIdentity};
     use crate::runtime::{
@@ -190,11 +442,13 @@ mod platform {
     const LSOF: &str = "/usr/sbin/lsof";
 
     pub(super) fn observe_processes() -> ProcessObservation {
-        let listening = match Command::new(LSOF)
-            .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"])
-            .output()
-        {
+        let mut command = Command::new(LSOF);
+        command.args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]);
+        let listening = match command_output(&mut command) {
             Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                return unavailable_processes("Listening TCP port inspection timed out.");
+            }
             Err(_) => return unavailable_processes("Listening TCP ports could not be read."),
         };
         if listening.stdout.is_empty()
@@ -250,15 +504,16 @@ mod platform {
             .map(|process| process.pid.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let output = match Command::new(LSOF)
-            .args(["-a", "-p", &pids, "-d", "cwd", "-Fn"])
-            .output()
-        {
+        let mut command = Command::new(LSOF);
+        command.args(["-a", "-p", &pids, "-d", "cwd", "-Fn"]);
+        let output = match command_output(&mut command) {
             Ok(output) => output,
-            Err(_) => {
-                notices.push(warning(
-                    "Some process working directories could not be verified.",
-                ));
+            Err(error) => {
+                notices.push(warning(if error.kind() == std::io::ErrorKind::TimedOut {
+                    "Process working directory inspection timed out."
+                } else {
+                    "Some process working directories could not be verified."
+                }));
                 return BTreeMap::new();
             }
         };

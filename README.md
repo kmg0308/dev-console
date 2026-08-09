@@ -12,7 +12,7 @@ TokenMeter, Runtime Atlas, DevConsole의 canonical monorepo입니다. 세 앱은
 
 ## 개발과 검증
 
-Node.js 24와 `rustup`을 준비합니다. Rust 버전은 `rust-toolchain.toml`에 고정되어 있습니다.
+Node.js 24와 `rustup`을 준비합니다. Rust 버전은 `rust-toolchain.toml`에 고정되어 있습니다. Windows 빌드에는 Visual Studio Build Tools의 `Desktop development with C++` 워크로드와 Windows SDK도 필요합니다.
 
 ```sh
 npm ci
@@ -61,10 +61,6 @@ npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.1.0.pkg unsign
 npm run test:runtime-atlas:macos-package -- "$APP"
 ```
 
-배포용 PKG는 `APP_SIGN_IDENTITY`에 Developer ID Application, `INSTALLER_SIGN_IDENTITY`에 같은 팀의 Developer ID Installer identity를 지정한 뒤 notarize·staple하고 다음 계약으로 검증합니다.
-
-```sh
-npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.1.0.pkg signed stapled
-```
+배포용 PKG는 `npm run release -- runtime-atlas universal-apple-darwin`이 기존 package·verify 스크립트를 재사용해 서명·공증·staple하고 `target/releases/runtime-atlas/universal-apple-darwin/release/bundle/pkg`에 생성합니다.
 
 서명 updater와 릴리스에 필요한 외부 설정은 [GitHub 설정](docs/github-setup.md)에 있습니다.

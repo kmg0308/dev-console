@@ -76,6 +76,7 @@ type DashboardSelection = {
 export type DashboardSnapshot = {
   generatedAt: Timestamp;
   selection: DashboardSelection;
+  sessionCount: number;
   total: TokenUsage;
   previousTotal: TokenUsage;
   changePercent: number | null;
@@ -233,6 +234,9 @@ export function TokenMeter() {
       .then((value) => {
         if (stale) return;
         setSnapshot(value);
+        setProject(value.selection.filters.project ?? "");
+        setModel(value.selection.filters.model ?? "");
+        setDevice(value.selection.filters.device ?? "");
         setActiveBucket(Math.max(0, value.buckets.length - 1));
         if (!exactInitialized.current) {
           setExact(value.settings.showFullTokenNumbers);
@@ -391,7 +395,7 @@ export function TokenMeter() {
         </div>
         <dl className="tm-metrics">
           {source === "all" && <><div><dt><i className="tm-dot tm-codex" />Codex</dt><dd>{formatTokens(snapshot.buckets.reduce((sum, item) => sum + BigInt(item.sourceUsage.codex?.total ?? "0"), 0n), exact)}</dd></div><div><dt><i className="tm-dot tm-claude" />Claude Code</dt><dd>{formatTokens(snapshot.buckets.reduce((sum, item) => sum + BigInt(item.sourceUsage.claude?.total ?? "0"), 0n), exact)}</dd></div></>}
-          <div><dt>Sessions</dt><dd>{integer.format(snapshot.groups.sessions.length)}</dd></div>
+          <div><dt>Sessions</dt><dd>{integer.format(snapshot.sessionCount)}</dd></div>
           <div><dt>Previous</dt><dd>{formatTokens(previous, exact)}</dd></div>
           <div><dt>Change</dt><dd className={change != null && change > 0 ? "tm-warning" : change != null && change < 0 ? "tm-positive" : ""}>{change == null ? (BigInt(snapshot.total.total) > 0n && previous === "0" ? "New" : "—") : `${change > 0 ? "+" : ""}${Math.round(change)}%`}</dd></div>
         </dl>

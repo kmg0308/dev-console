@@ -1,5 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(any(
+    test,
+    target_os = "windows",
+    feature = "runtime-atlas",
+    feature = "token-meter"
+))]
+use std::path::{Component, PathBuf};
+
 use serde::Serialize;
 #[cfg(any(feature = "runtime-atlas", feature = "token-meter"))]
 use tauri::Manager;
@@ -37,6 +45,73 @@ pub(crate) fn is_token_meter_updater_qa(identifier: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         })
+}
+
+#[cfg(any(
+    test,
+    target_os = "windows",
+    feature = "runtime-atlas",
+    feature = "token-meter"
+))]
+fn windows_updater_qa_root_for(
+    identifier: &str,
+    configured_root: Option<&str>,
+    configured_flavor: Option<&str>,
+    is_windows: bool,
+) -> Result<Option<PathBuf>, String> {
+    if !is_windows {
+        return Ok(None);
+    }
+    let (Some(root), Some(flavor)) = (configured_root, configured_flavor) else {
+        return if configured_root.is_none() && configured_flavor.is_none() {
+            Ok(None)
+        } else {
+            Err("Windows updater QA root and flavor must be configured together".to_owned())
+        };
+    };
+    let expected_flavor = match identifier {
+        TOKEN_METER_IDENTIFIER => "token-meter",
+        "com.kmg0308.runtimeatlas" => "runtime-atlas",
+        "com.kmg0308.devconsole" => "dev-console",
+        _ => return Err("Windows updater QA requires an exact production identity".to_owned()),
+    };
+    if flavor != expected_flavor {
+        return Err("Windows updater QA flavor does not match the production identity".to_owned());
+    }
+    let root = PathBuf::from(root);
+    if !root.is_absolute()
+        || root.parent().is_none()
+        || root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err("Windows updater QA root must be one normalized absolute path".to_owned());
+    }
+    Ok(Some(root))
+}
+
+#[cfg(any(
+    target_os = "windows",
+    feature = "runtime-atlas",
+    feature = "token-meter"
+))]
+pub(crate) fn windows_updater_qa_root(identifier: &str) -> Result<Option<PathBuf>, String> {
+    windows_updater_qa_root_for(
+        identifier,
+        option_env!("DEV_CONSOLE_WINDOWS_UPDATER_QA_ROOT"),
+        option_env!("DEV_CONSOLE_WINDOWS_UPDATER_QA_FLAVOR"),
+        cfg!(target_os = "windows"),
+    )
+}
+
+#[cfg(any(feature = "runtime-atlas", feature = "token-meter"))]
+pub(crate) fn platform_paths_equal(left: &std::path::Path, right: &std::path::Path) -> bool {
+    #[cfg(target_os = "windows")]
+    return left
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy());
+    #[cfg(not(target_os = "windows"))]
+    return left == right;
 }
 
 fn resolve_identity(identifier: &str) -> Result<AppIdentity, String> {
@@ -85,7 +160,27 @@ fn app_identity(app: tauri::AppHandle) -> Result<AppIdentity, String> {
 }
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    let mut context = tauri::generate_context!();
+    #[cfg(not(target_os = "windows"))]
     let context = tauri::generate_context!();
+    #[cfg(target_os = "windows")]
+    let windows_updater_qa_root = windows_updater_qa_root(&context.config().identifier)
+        .expect("Windows updater QA isolation is invalid");
+    #[cfg(target_os = "windows")]
+    if let Some(root) = &windows_updater_qa_root {
+        for window in &mut context.config_mut().app.windows {
+            window.data_directory = Some(root.join("webview").join(&window.label));
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new("--windows-updater-qa-preflight"))
+    {
+        let root = windows_updater_qa_root.expect("Windows updater QA isolation is missing");
+        println!("{}\n{}", context.config().identifier, root.display());
+        return;
+    }
     #[cfg(feature = "token-meter")]
     if std::env::args_os().nth(1).as_deref()
         == Some(std::ffi::OsStr::new("--token-meter-updater-qa-preflight"))
@@ -112,75 +207,60 @@ fn main() {
         app.manage(runtime_atlas::initialize(app.handle()).map_err(std::io::Error::other)?);
         Ok(())
     });
-    #[cfg(all(feature = "runtime-atlas", feature = "token-meter"))]
     let builder = builder.invoke_handler(tauri::generate_handler![
         app_identity,
         updater::updater_check,
         updater::updater_install,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_dashboard,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_rebuild_cache,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_set_sync_folder,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_set_source_paths,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_set_show_full_numbers,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_cleanup_preview,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_cleanup_apply,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_status,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_add_repository,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_remove_repository,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_set_language,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_save_action,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_delete_action,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_plan_action,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_confirm_action,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_set_worktree_order,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_stop_action,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_stop_process,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_link_process,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_unlink_process,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_advance_worktree_navigation,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_commit_worktree_navigation,
+        #[cfg(feature = "runtime-atlas")]
+        runtime_atlas::runtime_atlas_cancel_worktree_navigation,
+        #[cfg(feature = "runtime-atlas")]
         runtime_atlas::runtime_atlas_record_worktree_selection,
-    ]);
-    #[cfg(all(feature = "runtime-atlas", not(feature = "token-meter")))]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        app_identity,
-        updater::updater_check,
-        updater::updater_install,
-        runtime_atlas::runtime_atlas_status,
-        runtime_atlas::runtime_atlas_add_repository,
-        runtime_atlas::runtime_atlas_remove_repository,
-        runtime_atlas::runtime_atlas_set_language,
-        runtime_atlas::runtime_atlas_save_action,
-        runtime_atlas::runtime_atlas_delete_action,
-        runtime_atlas::runtime_atlas_plan_action,
-        runtime_atlas::runtime_atlas_confirm_action,
-        runtime_atlas::runtime_atlas_set_worktree_order,
-        runtime_atlas::runtime_atlas_stop_action,
-        runtime_atlas::runtime_atlas_stop_process,
-        runtime_atlas::runtime_atlas_link_process,
-        runtime_atlas::runtime_atlas_unlink_process,
-        runtime_atlas::runtime_atlas_advance_worktree_navigation,
-        runtime_atlas::runtime_atlas_commit_worktree_navigation,
-        runtime_atlas::runtime_atlas_record_worktree_selection,
-    ]);
-    #[cfg(all(not(feature = "runtime-atlas"), feature = "token-meter"))]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        app_identity,
-        updater::updater_check,
-        updater::updater_install,
-        token_meter::token_meter_dashboard,
-        token_meter::token_meter_rebuild_cache,
-        token_meter::token_meter_set_sync_folder,
-        token_meter::token_meter_set_source_paths,
-        token_meter::token_meter_set_show_full_numbers,
-        token_meter::token_meter_cleanup_preview,
-        token_meter::token_meter_cleanup_apply,
-    ]);
-    #[cfg(not(any(feature = "runtime-atlas", feature = "token-meter")))]
-    let builder = builder.invoke_handler(tauri::generate_handler![
-        app_identity,
-        updater::updater_check,
-        updater::updater_install,
+        #[cfg(feature = "runtime-atlas")]
+        runtime_atlas::runtime_atlas_open_worktree_in_vscode,
     ]);
     let app = builder
         .build(context)
@@ -234,5 +314,52 @@ mod tests {
             assert!(resolve_identity_for_features(invalid, true, false).is_err());
         }
         assert!(resolve_identity_for_features(TOKEN_METER_IDENTIFIER, true, true).is_err());
+    }
+
+    #[test]
+    fn windows_updater_qa_root_requires_exact_production_flavor_and_absolute_path() {
+        let root = std::env::temp_dir().join("dev-console-updater-qa");
+        let root = root.to_str().unwrap();
+        for (identifier, flavor) in [
+            (TOKEN_METER_IDENTIFIER, "token-meter"),
+            ("com.kmg0308.runtimeatlas", "runtime-atlas"),
+            ("com.kmg0308.devconsole", "dev-console"),
+        ] {
+            assert_eq!(
+                windows_updater_qa_root_for(identifier, Some(root), Some(flavor), true).unwrap(),
+                Some(PathBuf::from(root))
+            );
+        }
+        assert!(
+            windows_updater_qa_root_for(
+                TOKEN_METER_IDENTIFIER,
+                Some(root),
+                Some("dev-console"),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            windows_updater_qa_root_for(TOKEN_METER_IDENTIFIER, Some(root), None, true).is_err()
+        );
+        assert!(
+            windows_updater_qa_root_for(
+                TOKEN_METER_IDENTIFIER,
+                Some("relative"),
+                Some("token-meter"),
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(
+            windows_updater_qa_root_for(
+                TOKEN_METER_IDENTIFIER,
+                Some(root),
+                Some("token-meter"),
+                false
+            )
+            .unwrap(),
+            None
+        );
     }
 }
