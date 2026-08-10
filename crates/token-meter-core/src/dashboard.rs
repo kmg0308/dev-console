@@ -35,6 +35,7 @@ pub struct DashboardFilters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DashboardAccountState {
     Available(CodexAccountUsage),
+    Updating(Option<CodexAccountUsage>),
     Unavailable(String),
 }
 
@@ -42,6 +43,7 @@ pub enum DashboardAccountState {
 pub struct DashboardSnapshot {
     pub generated_at: DateTime<Utc>,
     pub selection: DashboardSelection,
+    pub event_count: usize,
     pub session_count: usize,
     pub total: TokenUsage,
     pub previous_total: TokenUsage,
@@ -228,6 +230,7 @@ where
             bucket: request.bucket.clone(),
             filters,
         },
+        event_count: filtered.len(),
         session_count,
         total,
         previous_total,
@@ -490,23 +493,20 @@ impl From<GroupedUsageRow> for DashboardUsageRow {
 
 impl From<&DashboardAccountState> for DashboardAccount {
     fn from(state: &DashboardAccountState) -> Self {
-        match state {
-            DashboardAccountState::Available(usage) => Self {
-                status: "available".to_owned(),
-                message: None,
-                fetched_at: Some(usage.fetched_at),
-                five_hour: usage.five_hour_window.as_ref().map(Into::into),
-                weekly: usage.seven_day_window.as_ref().map(Into::into),
-                reset_credits: usage.reset_credits.clone(),
-            },
-            DashboardAccountState::Unavailable(message) => Self {
-                status: "unavailable".to_owned(),
-                message: Some(message.clone()),
-                fetched_at: None,
-                five_hour: None,
-                weekly: None,
-                reset_credits: None,
-            },
+        let (status, message, usage) = match state {
+            DashboardAccountState::Available(usage) => ("available", None, Some(usage)),
+            DashboardAccountState::Updating(usage) => ("updating", None, usage.as_ref()),
+            DashboardAccountState::Unavailable(message) => {
+                ("unavailable", Some(message.clone()), None)
+            }
+        };
+        Self {
+            status: status.to_owned(),
+            message,
+            fetched_at: usage.map(|usage| usage.fetched_at),
+            five_hour: usage.and_then(|usage| usage.five_hour_window.as_ref().map(Into::into)),
+            weekly: usage.and_then(|usage| usage.seven_day_window.as_ref().map(Into::into)),
+            reset_credits: usage.and_then(|usage| usage.reset_credits.clone()),
         }
     }
 }
@@ -526,6 +526,7 @@ impl From<&CodexRateLimitWindow> for DashboardRateLimitWindow {
 pub struct DashboardSnapshotDto {
     pub generated_at: DateTime<Utc>,
     pub selection: DashboardSelection,
+    pub event_count: usize,
     pub session_count: usize,
     pub total: WireTokenUsage,
     pub previous_total: WireTokenUsage,
@@ -582,6 +583,7 @@ impl From<DashboardSnapshot> for DashboardSnapshotDto {
         Self {
             generated_at: snapshot.generated_at,
             selection: snapshot.selection,
+            event_count: snapshot.event_count,
             session_count: snapshot.session_count,
             total: snapshot.total.into(),
             previous_total: snapshot.previous_total.into(),
@@ -807,6 +809,22 @@ mod tests {
     }
 
     #[test]
+    fn updating_account_keeps_previous_usage_on_the_wire() {
+        let usage = CodexAccountUsage {
+            five_hour_window: None,
+            seven_day_window: None,
+            reset_credits: None,
+            fetched_at: at(11, 30),
+        };
+
+        let account = DashboardAccount::from(&DashboardAccountState::Updating(Some(usage)));
+
+        assert_eq!(account.status, "updating");
+        assert_eq!(account.message, None);
+        assert_eq!(account.fetched_at, Some(at(11, 30)));
+    }
+
+    #[test]
     fn wire_usage_keeps_i64_max_exact() {
         let snapshot = DashboardSnapshot {
             generated_at: at(12, 0),
@@ -816,6 +834,7 @@ mod tests {
                 bucket: "auto".into(),
                 filters: DashboardFilters::default(),
             },
+            event_count: usize::MAX,
             session_count: usize::MAX,
             total: TokenUsage::new(
                 i64::MAX,
@@ -855,6 +874,7 @@ mod tests {
             },
         };
         let json = serde_json::to_value(DashboardSnapshotDto::from(snapshot)).unwrap();
+        assert_eq!(json["eventCount"], usize::MAX);
         assert_eq!(json["sessionCount"], usize::MAX);
         assert_eq!(
             json["settings"]["icloudSyncFolderPath"],

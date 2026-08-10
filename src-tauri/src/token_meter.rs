@@ -3,7 +3,8 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
+    thread,
     time::Duration,
 };
 
@@ -19,7 +20,7 @@ use token_meter_core::{
         DashboardAccountState, DashboardRequest, DashboardSettings, DashboardSnapshotDto,
         compose_dashboard,
     },
-    models::TokenDeviceMetadata,
+    models::{ScanResult, TokenDeviceMetadata},
     scanner::{ScannerRoots, TokenLogScanner},
     settings::TokenMeterSettings,
     sync_store::{TokenSyncStore, merge_local_and_sync},
@@ -28,6 +29,7 @@ use uuid::Uuid;
 
 pub struct TokenMeterState {
     operation: Mutex<()>,
+    dashboard_data: Arc<Mutex<DashboardData>>,
     cleanup_plan: Mutex<Option<PendingCleanup>>,
     data_dir: PathBuf,
     source_isolation_root: Option<PathBuf>,
@@ -36,6 +38,12 @@ pub struct TokenMeterState {
     codex_home_env: Option<PathBuf>,
     account_executable: Option<OsString>,
     local_device_name: String,
+}
+
+struct DashboardData {
+    scan: Option<ScanResult>,
+    account: DashboardAccountState,
+    account_generation: u64,
 }
 
 struct PendingCleanup {
@@ -92,6 +100,11 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, Str
         .unwrap_or_else(|| local_data_dir.join("TokenMeter"));
     let state = TokenMeterState {
         operation: Mutex::new(()),
+        dashboard_data: Arc::new(Mutex::new(DashboardData {
+            scan: None,
+            account: DashboardAccountState::Updating(None),
+            account_generation: 0,
+        })),
         cleanup_plan: Mutex::new(None),
         data_dir,
         source_isolation_root: isolated_data_dir.map(|path| path.join("sources")),
@@ -145,8 +158,9 @@ fn isolated_data_directory(
 pub fn token_meter_dashboard(
     state: State<'_, TokenMeterState>,
     request: DashboardRequest,
+    refresh: bool,
 ) -> Result<DashboardSnapshotDto, String> {
-    state.with_lock(|state| state.dashboard(&request, false))
+    state.with_lock(|state| state.dashboard(&request, refresh))
 }
 
 #[tauri::command]
@@ -155,10 +169,8 @@ pub fn token_meter_rebuild_cache(
 ) -> Result<RebuildCacheResult, String> {
     state.with_lock(|state| {
         let settings = state.load_settings()?;
-        let scan = state.scan(&settings, true)?;
-        Ok(RebuildCacheResult {
-            event_count: scan.events.len(),
-        })
+        let event_count = state.refresh_dashboard_data(&settings, true)?;
+        Ok(RebuildCacheResult { event_count })
     })
 }
 
@@ -180,6 +192,7 @@ pub fn token_meter_set_sync_folder(
             settings
                 .save(&state.settings_path())
                 .map_err(string_error)?;
+            state.invalidate_dashboard_data()?;
             Ok(state.dashboard_settings(settings))
         })
     })
@@ -204,6 +217,7 @@ pub fn token_meter_set_source_paths(
             settings
                 .save(&state.settings_path())
                 .map_err(string_error)?;
+            state.invalidate_dashboard_data()?;
             Ok(state.dashboard_settings(settings))
         })
     })
@@ -293,30 +307,28 @@ impl TokenMeterState {
     fn dashboard(
         &self,
         request: &DashboardRequest,
-        rebuild_cache: bool,
+        refresh: bool,
     ) -> Result<DashboardSnapshotDto, String> {
         let settings = self.load_settings()?;
-        let scan = self.scan(&settings, rebuild_cache)?;
-        let account = if self.source_isolation_root.is_some() {
-            DashboardAccountState::Unavailable(
-                "Codex account access is disabled in updater QA.".to_owned(),
-            )
-        } else {
-            fetch_codex_account_usage(self.account_executable(&settings), Duration::from_secs(15))
-                .map(DashboardAccountState::Available)
-                .unwrap_or_else(|_| {
-                    DashboardAccountState::Unavailable(
-                "Codex account status is unavailable. Check that Codex is installed and signed in."
-                    .to_owned(),
-            )
-                })
-        };
+        let missing = self
+            .dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?
+            .scan
+            .is_none();
+        if refresh || missing {
+            self.refresh_dashboard_data(&settings, false)?;
+        }
+        let data = self
+            .dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
         let mut dashboard = compose_dashboard(
             request,
-            &scan,
+            data.scan.as_ref().expect("dashboard data was refreshed"),
             &settings,
             &self.local_device_name,
-            Some(&account),
+            Some(&data.account),
             Utc::now(),
             &Local,
             current_first_weekday()?,
@@ -324,6 +336,60 @@ impl TokenMeterState {
         .map_err(string_error)?;
         dashboard.settings.icloud_sync_folder_path = self.icloud_sync_folder_path();
         Ok(DashboardSnapshotDto::from(dashboard))
+    }
+
+    fn refresh_dashboard_data(
+        &self,
+        settings: &TokenMeterSettings,
+        rebuild_cache: bool,
+    ) -> Result<usize, String> {
+        let scan = self.scan(settings, rebuild_cache)?;
+        let event_count = scan.events.len();
+        let mut data = self
+            .dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+        data.account_generation = data.account_generation.wrapping_add(1);
+        let generation = data.account_generation;
+        let previous = match &data.account {
+            DashboardAccountState::Available(usage)
+            | DashboardAccountState::Updating(Some(usage)) => Some(usage.clone()),
+            DashboardAccountState::Updating(None) | DashboardAccountState::Unavailable(_) => None,
+        };
+        data.scan = Some(scan);
+        if self.source_isolation_root.is_some() {
+            data.account = DashboardAccountState::Unavailable(
+                "Codex account access is disabled in updater QA.".to_owned(),
+            );
+            return Ok(event_count);
+        }
+        data.account = DashboardAccountState::Updating(previous);
+        drop(data);
+
+        let executable = self.account_executable(settings).map(OsStr::to_os_string);
+        let dashboard_data = Arc::clone(&self.dashboard_data);
+        thread::spawn(move || {
+            let account = fetch_codex_account_usage(executable.as_deref(), Duration::from_secs(15))
+                .map(DashboardAccountState::Available)
+                .unwrap_or_else(|_| {
+                    DashboardAccountState::Unavailable(
+                "Codex account status is unavailable. Check that Codex is installed and signed in."
+                    .to_owned(),
+            )
+                });
+            update_account_if_current(&dashboard_data, generation, account);
+        });
+        Ok(event_count)
+    }
+
+    fn invalidate_dashboard_data(&self) -> Result<(), String> {
+        let mut data = self
+            .dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+        data.scan = None;
+        data.account_generation = data.account_generation.wrapping_add(1);
+        Ok(())
     }
 
     fn scan(
@@ -459,7 +525,11 @@ impl TokenMeterState {
             .map_err(string_error)?;
         let result = remove_cleanup_sources(&codex_home, &destination, &evidence, &authorization)
             .map_err(string_error)?;
-        self.scan(&settings, false)?;
+        let scan = self.scan(&settings, false)?;
+        self.dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?
+            .scan = Some(scan);
         Ok(CleanupApplyResult {
             archived_count: result.archived_file_count,
         })
@@ -597,6 +667,21 @@ impl TokenMeterState {
             .map(OsStr::new)
             .or(self.account_executable.as_deref())
     }
+}
+
+fn update_account_if_current(
+    dashboard_data: &Mutex<DashboardData>,
+    generation: u64,
+    account: DashboardAccountState,
+) -> bool {
+    let Ok(mut data) = dashboard_data.lock() else {
+        return false;
+    };
+    if data.account_generation != generation {
+        return false;
+    }
+    data.account = account;
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -897,6 +982,11 @@ mod tests {
     fn state(root: &Path) -> TokenMeterState {
         TokenMeterState {
             operation: Mutex::new(()),
+            dashboard_data: Arc::new(Mutex::new(DashboardData {
+                scan: None,
+                account: DashboardAccountState::Updating(None),
+                account_generation: 0,
+            })),
             cleanup_plan: Mutex::new(None),
             data_dir: root.join("TokenMeter"),
             source_isolation_root: None,
@@ -905,6 +995,92 @@ mod tests {
             codex_home_env: None,
             account_executable: Some(root.join("missing-codex").into_os_string()),
             local_device_name: "Test device".into(),
+        }
+    }
+
+    #[test]
+    fn filter_dashboard_uses_cached_scan_until_refresh_is_requested() {
+        use token_meter_core::{dashboard::DashboardFilters, models::TokenSource};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        state.dashboard_data.lock().unwrap().scan = Some(ScanResult::default());
+        let session = state.home_dir.join(".codex/sessions/2026/session.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(
+            session,
+            concat!(
+                "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",",
+                "\"payload\":{\"cwd\":\"/tmp/project\",\"model\":\"gpt\",",
+                "\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"total_tokens\":10},",
+                "\"total_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n"
+            ),
+        )
+        .unwrap();
+        let request = DashboardRequest {
+            source: TokenSource::All,
+            range: "All".into(),
+            bucket: "auto".into(),
+            filters: DashboardFilters::default(),
+        };
+
+        assert_eq!(state.dashboard(&request, false).unwrap().event_count, 0);
+        let refreshed = state.dashboard(&request, true).unwrap();
+        assert_eq!(refreshed.event_count, 1);
+    }
+
+    #[test]
+    fn stale_account_worker_cannot_replace_the_current_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        state.dashboard_data.lock().unwrap().account_generation = 2;
+
+        assert!(!update_account_if_current(
+            &state.dashboard_data,
+            1,
+            DashboardAccountState::Unavailable("stale".into()),
+        ));
+        assert!(matches!(
+            &state.dashboard_data.lock().unwrap().account,
+            DashboardAccountState::Updating(None)
+        ));
+        assert!(update_account_if_current(
+            &state.dashboard_data,
+            2,
+            DashboardAccountState::Unavailable("current".into()),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_returns_while_slow_account_worker_is_running() {
+        use std::{os::unix::fs::PermissionsExt, time::Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("slow-codex");
+        fs::write(&executable, "#!/bin/sh\nsleep 2\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        let mut state = state(directory.path());
+        state.account_executable = Some(executable.into_os_string());
+        let settings = state.load_settings().unwrap();
+
+        let started = Instant::now();
+        state.refresh_dashboard_data(&settings, false).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            &state.dashboard_data.lock().unwrap().account,
+            DashboardAccountState::Updating(None)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while matches!(
+            &state.dashboard_data.lock().unwrap().account,
+            DashboardAccountState::Updating(_)
+        ) {
+            assert!(Instant::now() < deadline, "account worker did not finish");
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -1088,13 +1264,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(dashboard.total.total, "0");
-        assert_eq!(
-            dashboard
-                .codex_account
-                .as_ref()
-                .map(|account| account.status.as_str()),
-            Some("unavailable")
-        );
         assert_eq!(
             state.settings_path(),
             directory.path().join("TokenMeter/settings.json")

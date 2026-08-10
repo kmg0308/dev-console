@@ -56,8 +56,8 @@ PKG로 설치된 전역 CLI가 있으면 서명 updater가 앱과 CLI를 함께 
 
 ```sh
 APP=target/universal-apple-darwin/release/bundle/macos/RuntimeAtlas.app
-APP_SIGN_IDENTITY=- npm run package:runtime-atlas:macos -- "$APP" dist/RuntimeAtlas-0.1.0.pkg
-npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.1.0.pkg unsigned none
+APP_SIGN_IDENTITY=- npm run package:runtime-atlas:macos -- "$APP" dist/RuntimeAtlas-0.2.0.pkg
+npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.2.0.pkg unsigned none
 npm run test:runtime-atlas:macos-package -- "$APP"
 ```
 

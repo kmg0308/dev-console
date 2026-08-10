@@ -14,8 +14,11 @@
         "title": "DevConsole",
         "width": 1180,
         "height": 780,
-        "minWidth": 800,
-        "minHeight": 620,
+        "minWidth": 640,
+        "minHeight": 720,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 16 },
         "center": true
       }
     ]

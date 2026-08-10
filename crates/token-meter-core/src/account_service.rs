@@ -20,8 +20,12 @@ use std::{
 };
 use thiserror::Error;
 
-const INITIALIZE: &[u8] = br#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"tokenmeter","title":"TokenMeter","version":"0.1.0"}}}
-"#;
+const INITIALIZE: &[u8] = concat!(
+    r#"{"method":"initialize","id":1,"params":{"clientInfo":{"name":"tokenmeter","title":"TokenMeter","version":""#,
+    env!("CARGO_PKG_VERSION"),
+    "\"}}}\n"
+)
+.as_bytes();
 const READ_RATE_LIMITS: &[u8] =
     b"{\"method\":\"initialized\"}\n{\"method\":\"account/rateLimits/read\",\"id\":2}\n";
 const MAX_LINE_BYTES: u64 = 1024 * 1024;

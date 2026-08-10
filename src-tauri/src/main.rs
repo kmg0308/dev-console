@@ -11,6 +11,12 @@ use std::path::{Component, PathBuf};
 use serde::Serialize;
 #[cfg(any(feature = "runtime-atlas", feature = "token-meter"))]
 use tauri::Manager;
+#[cfg(not(target_os = "macos"))]
+use tauri::menu::HELP_SUBMENU_ID;
+use tauri::{
+    Emitter,
+    menu::{Menu, MenuItem, MenuItemKind},
+};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 #[cfg(feature = "runtime-atlas")]
@@ -32,6 +38,7 @@ struct AppIdentity {
     kind: &'static str,
     display_name: &'static str,
     features: &'static [Feature],
+    platform: &'static str,
 }
 
 pub(crate) const TOKEN_METER_IDENTIFIER: &str = "local.tokenmeter.app";
@@ -133,21 +140,25 @@ fn resolve_identity_for_features(
             kind: "tokenMeter",
             display_name: "TokenMeter",
             features: &[Feature::TokenMeter],
+            platform: std::env::consts::OS,
         }),
         (true, false) if is_token_meter_updater_qa(identifier) => Ok(AppIdentity {
             kind: "tokenMeterUpdaterQa",
             display_name: "TokenMeter Updater QA",
             features: &[Feature::TokenMeter],
+            platform: std::env::consts::OS,
         }),
         (false, true) if identifier == "com.kmg0308.runtimeatlas" => Ok(AppIdentity {
             kind: "runtimeAtlas",
             display_name: "Runtime Atlas",
             features: &[Feature::RuntimeAtlas],
+            platform: std::env::consts::OS,
         }),
         (true, true) if identifier == "com.kmg0308.devconsole" => Ok(AppIdentity {
             kind: "devConsole",
             display_name: "DevConsole",
             features: &[Feature::RuntimeAtlas, Feature::TokenMeter],
+            platform: std::env::consts::OS,
         }),
         _ => Err(format!(
             "invalid app identity/features: {identifier} (token-meter={has_token_meter}, runtime-atlas={has_runtime_atlas})"
@@ -195,6 +206,32 @@ fn main() {
         return;
     }
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    let builder = builder
+        .menu(|app| {
+            let menu = Menu::default(app)?;
+            #[cfg(target_os = "macos")]
+            let update_menu = menu.items()?.into_iter().next();
+            #[cfg(not(target_os = "macos"))]
+            let update_menu = menu.get(HELP_SUBMENU_ID);
+            if let Some(MenuItemKind::Submenu(update_menu)) = update_menu {
+                update_menu.insert(
+                    &MenuItem::with_id(
+                        app,
+                        "check-for-updates",
+                        "Check for Updates…",
+                        true,
+                        None::<&str>,
+                    )?,
+                    usize::from(cfg!(target_os = "macos")),
+                )?;
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == "check-for-updates" {
+                let _ = app.emit("app:check-for-updates", ());
+            }
+        });
     let builder = if updater::updater_configured(context.config().plugins.0.get("updater")) {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     } else {
@@ -306,6 +343,12 @@ mod tests {
                 .unwrap()
                 .kind,
             "devConsole"
+        );
+        assert_eq!(
+            resolve_identity_for_features("com.kmg0308.devconsole", true, true)
+                .unwrap()
+                .platform,
+            std::env::consts::OS
         );
 
         let qa_identifier =
