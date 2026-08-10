@@ -73,6 +73,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("app:open-runtime-atlas-settings", () => {
+      setSelected("runtimeAtlas");
+      window.requestAnimationFrame(() => window.dispatchEvent(new Event("runtime-atlas:open-settings")));
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  useEffect(() => {
     if (!identity) return;
     void checkForUpdates(true);
     const interval = window.setInterval(() => void checkForUpdates(true), UPDATE_CHECK_INTERVAL_MS);
@@ -272,12 +283,12 @@ export function App() {
       )}
       {identity.features.includes("tokenMeter") && (
         <div hidden={selected !== "tokenMeter"} aria-hidden={selected !== "tokenMeter"}>
-          <TokenMeter update={standaloneUpdate} />
+          <TokenMeter active={selected === "tokenMeter"} update={standaloneUpdate} />
         </div>
       )}
       {identity.features.includes("runtimeAtlas") && (
         <div hidden={selected !== "runtimeAtlas"} aria-hidden={selected !== "runtimeAtlas"}>
-          <RuntimeAtlas update={standaloneUpdate} />
+          <RuntimeAtlas active={selected === "runtimeAtlas"} update={standaloneUpdate} />
         </div>
       )}
       <dialog

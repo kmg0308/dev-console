@@ -154,7 +154,7 @@ fn isolated_data_directory(
     Ok(Some(root))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_dashboard(
     state: State<'_, TokenMeterState>,
     request: DashboardRequest,
@@ -163,7 +163,7 @@ pub fn token_meter_dashboard(
     state.with_lock(|state| state.dashboard(&request, refresh))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_rebuild_cache(
     state: State<'_, TokenMeterState>,
 ) -> Result<RebuildCacheResult, String> {
@@ -174,7 +174,7 @@ pub fn token_meter_rebuild_cache(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_set_sync_folder(
     state: State<'_, TokenMeterState>,
     path: Option<String>,
@@ -198,7 +198,7 @@ pub fn token_meter_set_sync_folder(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_set_source_paths(
     state: State<'_, TokenMeterState>,
     paths: SourcePaths,
@@ -223,7 +223,7 @@ pub fn token_meter_set_source_paths(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_set_show_full_numbers(
     state: State<'_, TokenMeterState>,
     value: bool,
@@ -239,7 +239,7 @@ pub fn token_meter_set_show_full_numbers(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_cleanup_preview(
     state: State<'_, TokenMeterState>,
     older_than_days: u32,
@@ -247,7 +247,7 @@ pub fn token_meter_cleanup_preview(
     state.with_lock(|state| state.cleanup_preview(older_than_days))
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn token_meter_cleanup_apply(
     state: State<'_, TokenMeterState>,
     plan_id: Uuid,

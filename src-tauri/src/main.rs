@@ -214,6 +214,20 @@ fn main() {
             #[cfg(not(target_os = "macos"))]
             let update_menu = menu.get(HELP_SUBMENU_ID);
             if let Some(MenuItemKind::Submenu(update_menu)) = update_menu {
+                let insert_at = usize::from(cfg!(target_os = "macos"));
+                #[cfg(feature = "runtime-atlas")]
+                {
+                    update_menu.insert(
+                        &MenuItem::with_id(
+                            app,
+                            "runtime-atlas-settings",
+                            "Runtime Atlas Settings…",
+                            true,
+                            Some("CmdOrCtrl+,"),
+                        )?,
+                        insert_at,
+                    )?;
+                }
                 update_menu.insert(
                     &MenuItem::with_id(
                         app,
@@ -222,7 +236,7 @@ fn main() {
                         true,
                         None::<&str>,
                     )?,
-                    usize::from(cfg!(target_os = "macos")),
+                    insert_at + usize::from(cfg!(feature = "runtime-atlas")),
                 )?;
             }
             Ok(menu)
@@ -230,6 +244,10 @@ fn main() {
         .on_menu_event(|app, event| {
             if event.id() == "check-for-updates" {
                 let _ = app.emit("app:check-for-updates", ());
+            }
+            #[cfg(feature = "runtime-atlas")]
+            if event.id() == "runtime-atlas-settings" {
+                let _ = app.emit("app:open-runtime-atlas-settings", ());
             }
         });
     let builder = if updater::updater_configured(context.config().plugins.0.get("updater")) {
