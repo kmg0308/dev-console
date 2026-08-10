@@ -4,6 +4,7 @@ use std::{collections::HashSet, fs};
 use chrono::{DateTime, Utc};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    params_from_iter,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -353,19 +354,43 @@ impl TokenEventCache {
         events: &[TokenEvent],
         parse_error: bool,
     ) -> Result<(), CacheError> {
+        self.replace_events(OriginKind::LocalLog, snapshot, events, parse_error)
+    }
+
+    pub fn replace_sync_events(
+        &self,
+        snapshot: &FileSnapshot,
+        events: &[TokenEvent],
+    ) -> Result<(), CacheError> {
+        self.replace_events(OriginKind::SyncLedger, snapshot, events, false)
+    }
+
+    fn replace_events(
+        &self,
+        origin_kind: OriginKind,
+        snapshot: &FileSnapshot,
+        events: &[TokenEvent],
+        parse_error: bool,
+    ) -> Result<(), CacheError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         transaction.execute(
-            "DELETE FROM event_records WHERE origin_kind = 'local_log' AND origin_path = ?1",
-            [&snapshot.path],
+            "DELETE FROM event_records WHERE origin_kind = ?1 AND origin_path = ?2",
+            params![origin_kind.as_str(), snapshot.path],
         )?;
         transaction.execute(
-            "DELETE FROM origin_files WHERE origin_kind = 'local_log' AND origin_path = ?1",
-            [&snapshot.path],
+            "DELETE FROM origin_files WHERE origin_kind = ?1 AND origin_path = ?2",
+            params![origin_kind.as_str(), snapshot.path],
         )?;
-        insert_origin(&transaction, snapshot, parse_error, events.len() as i64)?;
+        insert_origin(
+            &transaction,
+            origin_kind,
+            snapshot,
+            parse_error,
+            events.len() as i64,
+        )?;
         if !parse_error {
-            insert_events(&transaction, OriginKind::LocalLog, &snapshot.path, events)?;
+            insert_events(&transaction, origin_kind, &snapshot.path, events)?;
         }
         transaction.commit()?;
         Ok(())
@@ -376,26 +401,151 @@ impl TokenEventCache {
         snapshot: &FileSnapshot,
         events: &[TokenEvent],
     ) -> Result<(), CacheError> {
+        self.append_events(OriginKind::LocalLog, snapshot, events)
+    }
+
+    pub fn append_sync_events(
+        &self,
+        snapshot: &FileSnapshot,
+        events: &[TokenEvent],
+    ) -> Result<(), CacheError> {
+        self.append_events(OriginKind::SyncLedger, snapshot, events)
+    }
+
+    fn append_events(
+        &self,
+        origin_kind: OriginKind,
+        snapshot: &FileSnapshot,
+        events: &[TokenEvent],
+    ) -> Result<(), CacheError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         let existing_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM event_records WHERE origin_kind = 'local_log' AND origin_path = ?1",
-            [&snapshot.path],
+            "SELECT COUNT(*) FROM event_records WHERE origin_kind = ?1 AND origin_path = ?2",
+            params![origin_kind.as_str(), snapshot.path],
             |row| row.get(0),
         )?;
         transaction.execute(
-            "DELETE FROM origin_files WHERE origin_kind = 'local_log' AND origin_path = ?1",
-            [&snapshot.path],
+            "DELETE FROM origin_files WHERE origin_kind = ?1 AND origin_path = ?2",
+            params![origin_kind.as_str(), snapshot.path],
         )?;
         insert_origin(
             &transaction,
+            origin_kind,
             snapshot,
             false,
             existing_count.saturating_add(events.len() as i64),
         )?;
-        insert_events(&transaction, OriginKind::LocalLog, &snapshot.path, events)?;
+        insert_events(&transaction, origin_kind, &snapshot.path, events)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    pub fn remove_missing_sync_origins(&self, keeping: &HashSet<String>) -> Result<(), CacheError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT origin_path FROM origin_files WHERE origin_kind = 'sync_ledger'")?;
+        let paths = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|path| !keeping.contains(path))
+            .collect::<Vec<_>>();
+        drop(statement);
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.remove_origins(OriginKind::SyncLedger, paths.iter().map(String::as_str))
+    }
+
+    pub fn remove_sync_origin(&self, path: &str) -> Result<(), CacheError> {
+        self.remove_origins(OriginKind::SyncLedger, [path])
+    }
+
+    fn remove_origins<'b>(
+        &self,
+        origin_kind: OriginKind,
+        paths: impl IntoIterator<Item = &'b str>,
+    ) -> Result<(), CacheError> {
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        for path in paths {
+            transaction.execute(
+                "DELETE FROM event_records WHERE origin_kind = ?1 AND origin_path = ?2",
+                params![origin_kind.as_str(), path],
+            )?;
+            transaction.execute(
+                "DELETE FROM origin_files WHERE origin_kind = ?1 AND origin_path = ?2",
+                params![origin_kind.as_str(), path],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn sync_events(
+        &self,
+        paths: &[String],
+        event_after: Option<DateTime<Utc>>,
+    ) -> Result<Vec<TokenEvent>, CacheError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let values = (1..=paths.len())
+            .map(|index| format!("(?{index})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cutoff = paths.len() + 1;
+        let sql = format!(
+            "WITH current(origin_path) AS (VALUES {values})
+             SELECT event_json FROM event_records AS event
+             WHERE event.origin_kind = 'sync_ledger'
+               AND event.origin_path IN (SELECT origin_path FROM current)
+               AND (?{cutoff} IS NULL OR event.timestamp >= ?{cutoff})
+               AND event.origin_path = (
+                    SELECT MIN(first.origin_path) FROM event_records AS first
+                    WHERE first.origin_kind = 'sync_ledger'
+                      AND first.origin_path IN (SELECT origin_path FROM current)
+                      AND first.device_id = event.device_id
+                      AND first.event_id = event.event_id
+               )
+             ORDER BY event.timestamp, event.event_id"
+        );
+        let mut parameters = paths
+            .iter()
+            .cloned()
+            .map(rusqlite::types::Value::Text)
+            .collect::<Vec<_>>();
+        parameters.push(event_after.map(unix_timestamp).into());
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows =
+            statement.query_map(params_from_iter(parameters), |row| row.get::<_, Vec<u8>>(0))?;
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|json| serde_json::from_slice(&json).ok())
+            .collect())
+    }
+
+    pub fn existing_sync_event_keys(
+        &self,
+        origin_path: &str,
+        candidates: &[(String, String)],
+    ) -> Result<HashSet<(String, String)>, CacheError> {
+        let mut statement = self.connection.prepare(
+            "SELECT EXISTS(
+                SELECT 1 FROM event_records
+                WHERE origin_kind = 'sync_ledger' AND origin_path = ?1
+                  AND device_id = ?2 AND event_id = ?3
+             )",
+        )?;
+        let mut existing = HashSet::new();
+        for (device_id, event_id) in candidates {
+            if statement.query_row(params![origin_path, device_id, event_id], |row| row.get(0))? {
+                existing.insert((device_id.clone(), event_id.clone()));
+            }
+        }
+        Ok(existing)
     }
 
     pub fn remove_missing_local_origins(
@@ -424,21 +574,7 @@ impl TokenEventCache {
         if paths.is_empty() {
             return Ok(());
         }
-
-        let transaction =
-            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        for path in paths {
-            transaction.execute(
-                "DELETE FROM event_records WHERE origin_kind = 'local_log' AND origin_path = ?1",
-                [&path],
-            )?;
-            transaction.execute(
-                "DELETE FROM origin_files WHERE origin_kind = 'local_log' AND origin_path = ?1",
-                [&path],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
+        self.remove_origins(OriginKind::LocalLog, paths.iter().map(String::as_str))
     }
 
     pub fn events(
@@ -714,6 +850,7 @@ impl TokenEventCache {
 
 fn insert_origin(
     connection: &Connection,
+    origin_kind: OriginKind,
     snapshot: &FileSnapshot,
     parse_error: bool,
     event_count: i64,
@@ -722,8 +859,9 @@ fn insert_origin(
         "INSERT INTO origin_files (
             origin_kind, origin_path, source, file_size, modified_at, parser_version,
             device_id, parse_error, event_count, first_event_at, last_event_at, scanned_at
-         ) VALUES ('local_log', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL, ?10)",
         params![
+            origin_kind.as_str(),
             snapshot.path,
             snapshot.source.map(source_name),
             snapshot.size,

@@ -138,6 +138,19 @@ pub enum DashboardError {
     InvalidBucket(String),
 }
 
+pub fn dashboard_event_window_start<Tz: TimeZone>(
+    request: &DashboardRequest,
+    now: DateTime<Utc>,
+    timezone: &Tz,
+) -> Result<Option<DateTime<Utc>>, DashboardError>
+where
+    Tz::Offset: Copy,
+{
+    let range = parse_range(&request.range)?;
+    Ok((range != TimeRangePreset::All)
+        .then(|| range.previous_interval(now, timezone, None, None).start))
+}
+
 /// Builds a dashboard without reading files or depending on a UI/runtime.
 ///
 /// Options and rows use locale-independent byte ordering (and grouped rows use
@@ -728,6 +741,21 @@ mod tests {
                 Ok(expected)
             );
         }
+    }
+
+    #[test]
+    fn dashboard_window_includes_the_previous_interval() {
+        let now = at(12, 0);
+        let timezone = FixedOffset::east_opt(0).unwrap();
+
+        assert_eq!(
+            dashboard_event_window_start(&request("8h", "auto"), now, &timezone).unwrap(),
+            Some(now - Duration::hours(16))
+        );
+        assert_eq!(
+            dashboard_event_window_start(&request("All", "auto"), now, &timezone).unwrap(),
+            None
+        );
     }
 
     #[test]

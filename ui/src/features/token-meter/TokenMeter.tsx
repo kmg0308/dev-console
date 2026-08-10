@@ -340,7 +340,8 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>();
   const [reload, setReload] = useState(0);
-  const refreshRequested = useRef(true);
+  const refreshRequested = useRef(false);
+  const refreshAfterLoad = useRef(true);
   const [exact, setExact] = useState(false);
   const exactInitialized = useRef(false);
   const [activeBucket, setActiveBucket] = useState(0);
@@ -367,11 +368,13 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   useEffect(() => {
     if (!active) {
       wasActive.current = false;
+      void invoke("token_meter_cancel_dashboard_refresh").catch(() => undefined);
       return;
     }
     if (!wasActive.current) {
       wasActive.current = true;
-      refreshRequested.current = true;
+      if (snapshot) refreshRequested.current = true;
+      else refreshAfterLoad.current = true;
     }
     if (loadInFlight.current) {
       pendingLoad.current = true;
@@ -416,8 +419,16 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
             codexExecutablePath: value.settings.codexExecutablePath ?? "",
           });
         }
+        if (!refresh && refreshAfterLoad.current) {
+          refreshAfterLoad.current = false;
+          refreshRequested.current = true;
+          pendingLoad.current = true;
+        }
       })
-      .catch((reason: unknown) => { if (!stale) setLoadError(errorMessage(reason)); })
+      .catch((reason: unknown) => {
+        const message = errorMessage(reason);
+        if (!stale && message !== "TokenMeter refresh was cancelled.") setLoadError(message);
+      })
       .finally(() => {
         loadInFlight.current = false;
         if (!stale) setLoading(false);
@@ -438,7 +449,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   useEffect(() => {
     if (!active) return;
     const refreshTimer = window.setInterval(() => {
-      if (document.visibilityState === "visible") refreshDashboard();
+      if (document.visibilityState === "visible" && !loadInFlight.current) refreshDashboard();
     }, 60_000);
     const clockTimer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => {
@@ -497,7 +508,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       });
       sourcePathsDirty.current = false;
       setAction({ kind: "success", scope: "sources", message: "Data source paths updated." });
-      setReload((value) => value + 1);
+      refreshDashboard();
     } catch (reason) {
       setAction({ kind: "error", scope: "sources", message: errorMessage(reason) });
     }
@@ -512,7 +523,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       setSyncPath(settings.syncFolderPath ?? "");
       syncPathDirty.current = false;
       setAction({ kind: "success", scope: "sync", message: path ? "Sync folder updated." : "Sync turned off." });
-      setReload((value) => value + 1);
+      refreshDashboard();
     } catch (reason) {
       setAction({ kind: "error", scope: "sync", message: errorMessage(reason) });
     }
@@ -614,7 +625,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
         <div className="tm-section-heading">
           <h3 id="tm-usage-title">Usage</h3>
           <div className="tm-controls">
-            <label className="tm-select-control"><CalendarBlank weight="bold" /><span className="tm-sr-only">Range</span><select value={range} onChange={(event) => setRange(event.target.value)}>{RANGES.map((value) => <option key={value}>{value}</option>)}</select><CaretDown className="tm-select-chevron" weight="bold" /></label>
+            <label className="tm-select-control"><CalendarBlank weight="bold" /><span className="tm-sr-only">Range</span><select value={range} onChange={(event) => { refreshRequested.current = true; setRange(event.target.value); }}>{RANGES.map((value) => <option key={value}>{value}</option>)}</select><CaretDown className="tm-select-chevron" weight="bold" /></label>
             <label className="tm-select-control"><ChartBarHorizontal weight="bold" /><span className="tm-sr-only">Bucket</span><select value={bucket} onChange={(event) => setBucket(event.target.value)}>{BUCKETS.map(([value, label]) => <option value={value} key={value}>{value === "auto" ? `${label}: ${autoBucketLabel(range)}` : label}</option>)}</select><CaretDown className="tm-select-chevron" weight="bold" /></label>
           </div>
         </div>
