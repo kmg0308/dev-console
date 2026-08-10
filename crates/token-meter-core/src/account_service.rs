@@ -496,7 +496,7 @@ impl ProcessTree {
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject,
         };
-        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
@@ -517,7 +517,7 @@ impl ProcessTree {
             unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
             return Err(error);
         }
-        command.creation_flags(CREATE_SUSPENDED);
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         Ok(Self(job))
     }
 

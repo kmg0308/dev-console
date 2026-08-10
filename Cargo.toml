@@ -10,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.2.2"
+version = "0.2.3"
 
 [workspace.dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }

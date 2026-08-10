@@ -51,19 +51,19 @@ jobs:
             product: TokenMeter
             binary: TokenMeter
             identifier: local.tokenmeter.app
-            version: 0.2.2
+            version: 0.2.3
             runtime: false
           - id: runtime-atlas
             product: RuntimeAtlas
             binary: RuntimeAtlas
             identifier: com.kmg0308.runtimeatlas
-            version: 0.2.2
+            version: 0.2.3
             runtime: true
           - id: dev-console
             product: DevConsole
             binary: DevConsole
             identifier: com.kmg0308.devconsole
-            version: 0.2.2
+            version: 0.2.3
             runtime: true
         platform: [macos, windows]
         include:
