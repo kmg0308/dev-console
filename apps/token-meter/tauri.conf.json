@@ -1,0 +1,33 @@
+{
+  "productName": "TokenMeter",
+  "mainBinaryName": "TokenMeter",
+  "identifier": "local.tokenmeter.app",
+  "build": {
+    "features": ["token-meter"]
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "TokenMeter",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 360,
+        "minHeight": 620,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 14, "y": 16 },
+        "center": true
+      }
+    ]
+  },
+  "bundle": {
+    "icon": [
+      "icons/token-meter-32x32.png",
+      "icons/token-meter-128x128.png",
+      "icons/token-meter-128x128@2x.png",
+      "icons/token-meter.icns",
+      "icons/token-meter.ico"
+    ]
+  }
+}

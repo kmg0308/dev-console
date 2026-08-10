@@ -1,0 +1,26 @@
+[package]
+name = "runtime-atlas-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "runtime-atlas"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+runtime-atlas-core = { path = "../runtime-atlas-core" }
+serde.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+uuid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
