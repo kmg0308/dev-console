@@ -14,11 +14,11 @@ TokenMeter, Runtime Atlas, DevConsole의 canonical monorepo입니다. 세 앱은
 
 | 앱 | macOS universal | Windows x64 |
 | --- | --- | --- |
-| TokenMeter | [![TokenMeter macOS DMG](https://img.shields.io/badge/macOS-DMG-000000?logo=apple&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.0/TokenMeter_0.2.0_universal.dmg) | [![TokenMeter Windows x64](https://img.shields.io/badge/Windows-x64_EXE-0078D4?logo=windows11&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.0/TokenMeter_0.2.0_x64-setup.exe) |
-| Runtime Atlas | [![Runtime Atlas macOS DMG](https://img.shields.io/badge/macOS-DMG-000000?logo=apple&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.0/RuntimeAtlas_0.2.0_universal.dmg) | [![Runtime Atlas Windows x64](https://img.shields.io/badge/Windows-x64_EXE-0078D4?logo=windows11&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.0/RuntimeAtlas_0.2.0_x64-setup.exe) |
-| DevConsole | [![DevConsole macOS DMG](https://img.shields.io/badge/macOS-DMG-000000?logo=apple&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.0/DevConsole_0.2.0_universal.dmg) | [![DevConsole Windows x64](https://img.shields.io/badge/Windows-x64_EXE-0078D4?logo=windows11&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.0/DevConsole_0.2.0_x64-setup.exe) |
+| TokenMeter | [![TokenMeter macOS DMG](https://img.shields.io/badge/macOS-DMG-000000?logo=apple&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.1/TokenMeter_0.2.1_universal.dmg) | [![TokenMeter Windows x64](https://img.shields.io/badge/Windows-x64_EXE-0078D4?logo=windows11&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.1/TokenMeter_0.2.1_x64-setup.exe) |
+| Runtime Atlas | [![Runtime Atlas macOS DMG](https://img.shields.io/badge/macOS-DMG-000000?logo=apple&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.1/RuntimeAtlas_0.2.1_universal.dmg) | [![Runtime Atlas Windows x64](https://img.shields.io/badge/Windows-x64_EXE-0078D4?logo=windows11&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.1/RuntimeAtlas_0.2.1_x64-setup.exe) |
+| DevConsole | [![DevConsole macOS DMG](https://img.shields.io/badge/macOS-DMG-000000?logo=apple&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.1/DevConsole_0.2.1_universal.dmg) | [![DevConsole Windows x64](https://img.shields.io/badge/Windows-x64_EXE-0078D4?logo=windows11&logoColor=white)](https://github.com/kmg0308/dev-console/releases/download/v0.2.1/DevConsole_0.2.1_x64-setup.exe) |
 
-`v0.2.0`은 GitHub Actions가 빌드하고 검사한 unsigned 테스트 릴리스입니다. macOS에서는 앱을 Control-클릭한 뒤 **열기**를 선택해야 할 수 있고, Windows에서는 공식 GitHub Release에서 받은 파일인지 확인한 뒤 SmartScreen의 **추가 정보 → 실행**을 선택해야 할 수 있습니다. CI는 macOS 14와 Windows Server 2022에서 실행되므로 macOS 13과 Windows 10 22H2 실제 동작은 직접 확인해야 합니다.
+`v0.2.1`은 GitHub Actions가 빌드하고 검사한 unsigned 테스트 릴리스입니다. macOS에서는 앱을 Control-클릭한 뒤 **열기**를 선택해야 할 수 있고, Windows에서는 공식 GitHub Release에서 받은 파일인지 확인한 뒤 SmartScreen의 **추가 정보 → 실행**을 선택해야 할 수 있습니다. CI는 macOS 14와 Windows Server 2022에서 실행되므로 macOS 13과 Windows 10 22H2 실제 동작은 직접 확인해야 합니다.
 
 ## 개발과 검증
 
@@ -66,8 +66,8 @@ PKG로 설치된 전역 CLI가 있으면 서명 updater가 앱과 CLI를 함께 
 
 ```sh
 APP=target/universal-apple-darwin/release/bundle/macos/RuntimeAtlas.app
-APP_SIGN_IDENTITY=- npm run package:runtime-atlas:macos -- "$APP" dist/RuntimeAtlas-0.2.0.pkg
-npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.2.0.pkg unsigned none
+APP_SIGN_IDENTITY=- npm run package:runtime-atlas:macos -- "$APP" dist/RuntimeAtlas-0.2.1.pkg
+npm run verify:runtime-atlas:macos-package -- dist/RuntimeAtlas-0.2.1.pkg unsigned none
 npm run test:runtime-atlas:macos-package -- "$APP"
 ```
 
