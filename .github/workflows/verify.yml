@@ -72,12 +72,16 @@ jobs:
             os: macos-14
             target: universal-apple-darwin
             bundles: app,dmg
+            bundle_dir: dmg
+            bundle_suffix: universal.dmg
           # This validates an x64 NSIS package on Windows Server, not Windows 10 22H2.
           - platform: windows
             name: Windows Server 2022 x64 package smoke
             os: windows-2022
             target: x86_64-pc-windows-msvc
             bundles: nsis
+            bundle_dir: nsis
+            bundle_suffix: x64-setup.exe
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -117,6 +121,15 @@ jobs:
           -Version '${{ matrix.app.version }}'
           -RuntimeFeature '${{ matrix.app.runtime }}'
           -AllowWindowsServerSmoke
+      - name: Preserve verified unsigned bundle
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ matrix.app.id }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/bundle/${{ matrix.bundle_dir }}/${{ matrix.app.product }}_${{ matrix.app.version }}_${{ matrix.bundle_suffix }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
   verify:
     if: ${{ always() }}
