@@ -270,6 +270,8 @@ fn main() {
         #[cfg(feature = "token-meter")]
         token_meter::token_meter_dashboard,
         #[cfg(feature = "token-meter")]
+        token_meter::token_meter_cancel_dashboard_refresh,
+        #[cfg(feature = "token-meter")]
         token_meter::token_meter_rebuild_cache,
         #[cfg(feature = "token-meter")]
         token_meter::token_meter_set_sync_folder,

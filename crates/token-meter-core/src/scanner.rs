@@ -150,10 +150,10 @@ impl<'a> TokenLogScanner<'a> {
         fresh_events.extend(hermes.events.iter().cloned());
         let cached_events = self
             .cache
-            .and_then(|cache| cache.events(event_after.or(modified_after)).ok())
+            .and_then(|cache| cache.events(event_after).ok())
             .unwrap_or_default();
         let events = deduplicated(cached_events.into_iter().chain(fresh_events));
-        self.make_result(roots, hermes, events, event_after.or(modified_after))
+        self.make_result(roots, hermes, events, event_after)
     }
 
     pub fn cached_result(&self, event_after: Option<DateTime<Utc>>) -> Option<ScanResult> {
@@ -886,6 +886,21 @@ mod tests {
                 .events
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn file_refresh_window_does_not_truncate_the_requested_event_window() {
+        let directory = tempdir().unwrap();
+        let roots = roots(directory.path());
+        write_codex(&configured(&roots.codex_sessions).join("one.jsonl"), 10);
+        let cache =
+            TokenEventCache::open_or_create(&directory.path().join("cache.sqlite")).unwrap();
+        let scanner =
+            TokenLogScanner::new(roots, TokenDeviceMetadata::local_fallback(), Some(&cache));
+        assert_eq!(scanner.scan(None, None, || false).events.len(), 1);
+
+        let future = DateTime::from_timestamp(2_000_000_000, 0).unwrap();
+        assert_eq!(scanner.scan(Some(future), None, || false).events.len(), 1);
     }
 
     #[test]

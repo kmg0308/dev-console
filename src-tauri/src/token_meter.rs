@@ -3,12 +3,15 @@ use std::{
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::Duration,
 };
 
-use chrono::{Local, Utc, Weekday};
+use chrono::{Duration as ChronoDuration, Local, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, State};
 use token_meter_core::{
@@ -18,7 +21,7 @@ use token_meter_core::{
     cleanup_archive::{cleanup_source_snapshot, create_cleanup_archive, remove_cleanup_sources},
     dashboard::{
         DashboardAccountState, DashboardRequest, DashboardSettings, DashboardSnapshotDto,
-        compose_dashboard,
+        compose_dashboard, dashboard_event_window_start,
     },
     models::{ScanResult, TokenDeviceMetadata},
     scanner::{ScannerRoots, TokenLogScanner},
@@ -29,6 +32,7 @@ use uuid::Uuid;
 
 pub struct TokenMeterState {
     operation: Mutex<()>,
+    scan_generation: AtomicU64,
     dashboard_data: Arc<Mutex<DashboardData>>,
     cleanup_plan: Mutex<Option<PendingCleanup>>,
     data_dir: PathBuf,
@@ -42,6 +46,7 @@ pub struct TokenMeterState {
 
 struct DashboardData {
     scan: Option<ScanResult>,
+    loaded_after: Option<chrono::DateTime<Utc>>,
     account: DashboardAccountState,
     account_generation: u64,
 }
@@ -50,6 +55,8 @@ struct PendingCleanup {
     id: Uuid,
     plan: CodexSessionCleanupPlan,
 }
+
+const DASHBOARD_REFRESH_CANCELLED: &str = "TokenMeter refresh was cancelled.";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,8 +107,10 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, Str
         .unwrap_or_else(|| local_data_dir.join("TokenMeter"));
     let state = TokenMeterState {
         operation: Mutex::new(()),
+        scan_generation: AtomicU64::new(0),
         dashboard_data: Arc::new(Mutex::new(DashboardData {
             scan: None,
+            loaded_after: None,
             account: DashboardAccountState::Updating(None),
             account_generation: 0,
         })),
@@ -160,16 +169,26 @@ pub fn token_meter_dashboard(
     request: DashboardRequest,
     refresh: bool,
 ) -> Result<DashboardSnapshotDto, String> {
-    state.with_lock(|state| state.dashboard(&request, refresh))
+    state.with_lock(|state| {
+        let scan_epoch = state.scan_epoch();
+        state.dashboard(&request, refresh, scan_epoch)
+    })
+}
+
+#[tauri::command]
+pub fn token_meter_cancel_dashboard_refresh(state: State<'_, TokenMeterState>) {
+    state.cancel_scan();
 }
 
 #[tauri::command(async)]
 pub fn token_meter_rebuild_cache(
     state: State<'_, TokenMeterState>,
 ) -> Result<RebuildCacheResult, String> {
+    state.cancel_scan();
     state.with_lock(|state| {
         let settings = state.load_settings()?;
-        let event_count = state.refresh_dashboard_data(&settings, true)?;
+        let event_count =
+            state.refresh_dashboard_data(&settings, true, None, None, true, || false)?;
         Ok(RebuildCacheResult { event_count })
     })
 }
@@ -179,6 +198,7 @@ pub fn token_meter_set_sync_folder(
     state: State<'_, TokenMeterState>,
     path: Option<String>,
 ) -> Result<DashboardSettings, String> {
+    state.cancel_scan();
     state.with_lock(|state| {
         if state.source_isolation_root.is_some() {
             return Err("Source configuration is disabled in updater QA.".to_owned());
@@ -203,6 +223,7 @@ pub fn token_meter_set_source_paths(
     state: State<'_, TokenMeterState>,
     paths: SourcePaths,
 ) -> Result<DashboardSettings, String> {
+    state.cancel_scan();
     state.with_lock(|state| {
         if state.source_isolation_root.is_some() {
             return Err("Source configuration is disabled in updater QA.".to_owned());
@@ -308,16 +329,56 @@ impl TokenMeterState {
         &self,
         request: &DashboardRequest,
         refresh: bool,
+        scan_epoch: u64,
     ) -> Result<DashboardSnapshotDto, String> {
         let settings = self.load_settings()?;
-        let missing = self
-            .dashboard_data
-            .lock()
-            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?
-            .scan
-            .is_none();
-        if refresh || missing {
-            self.refresh_dashboard_data(&settings, false)?;
+        let now = Utc::now();
+        let required_after =
+            dashboard_event_window_start(request, now, &Local).map_err(string_error)?;
+        let (missing, covers_window) = {
+            let data = self
+                .dashboard_data
+                .lock()
+                .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+            (
+                data.scan.is_none(),
+                data.scan.is_some() && window_covers(data.loaded_after, required_after),
+            )
+        };
+        let mut source_scanned = false;
+        if missing && !refresh {
+            let scan = self.cached_scan(&settings, required_after)?;
+            let mut data = self
+                .dashboard_data
+                .lock()
+                .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+            data.scan = Some(scan);
+            data.loaded_after = required_after;
+        } else if !covers_window {
+            self.refresh_dashboard_data(
+                &settings,
+                false,
+                required_after,
+                required_after,
+                true,
+                || !self.scan_is_current(scan_epoch),
+            )?;
+            source_scanned = true;
+        }
+        if refresh && !source_scanned {
+            let loaded_after = self
+                .dashboard_data
+                .lock()
+                .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?
+                .loaded_after;
+            self.refresh_dashboard_data(
+                &settings,
+                false,
+                Some(now - ChronoDuration::hours(48)),
+                loaded_after,
+                true,
+                || !self.scan_is_current(scan_epoch),
+            )?;
         }
         let data = self
             .dashboard_data
@@ -329,7 +390,7 @@ impl TokenMeterState {
             &settings,
             &self.local_device_name,
             Some(&data.account),
-            Utc::now(),
+            now,
             &Local,
             current_first_weekday()?,
         )
@@ -342,8 +403,22 @@ impl TokenMeterState {
         &self,
         settings: &TokenMeterSettings,
         rebuild_cache: bool,
+        modified_after: Option<chrono::DateTime<Utc>>,
+        event_after: Option<chrono::DateTime<Utc>>,
+        synchronize_sync: bool,
+        is_cancelled: impl Fn() -> bool,
     ) -> Result<usize, String> {
-        let scan = self.scan(settings, rebuild_cache)?;
+        let scan = self.scan(
+            settings,
+            rebuild_cache,
+            modified_after,
+            event_after,
+            synchronize_sync,
+            &is_cancelled,
+        )?;
+        if is_cancelled() {
+            return Err(DASHBOARD_REFRESH_CANCELLED.to_owned());
+        }
         let event_count = scan.events.len();
         let mut data = self
             .dashboard_data
@@ -357,6 +432,7 @@ impl TokenMeterState {
             DashboardAccountState::Updating(None) | DashboardAccountState::Unavailable(_) => None,
         };
         data.scan = Some(scan);
+        data.loaded_after = event_after;
         if self.source_isolation_root.is_some() {
             data.account = DashboardAccountState::Unavailable(
                 "Codex account access is disabled in updater QA.".to_owned(),
@@ -388,14 +464,61 @@ impl TokenMeterState {
             .lock()
             .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
         data.scan = None;
+        data.loaded_after = None;
         data.account_generation = data.account_generation.wrapping_add(1);
         Ok(())
+    }
+
+    fn scan_epoch(&self) -> u64 {
+        self.scan_generation.load(Ordering::SeqCst)
+    }
+
+    fn cancel_scan(&self) {
+        self.scan_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn scan_is_current(&self, generation: u64) -> bool {
+        self.scan_generation.load(Ordering::SeqCst) == generation
+    }
+
+    fn cached_scan(
+        &self,
+        settings: &TokenMeterSettings,
+        event_after: Option<chrono::DateTime<Utc>>,
+    ) -> Result<ScanResult, String> {
+        let cache = TokenEventCache::open_or_create(&self.cache_path()).map_err(string_error)?;
+        let local_device = TokenDeviceMetadata::new(
+            settings.local_device_id.clone(),
+            self.local_device_name.clone(),
+        );
+        let sync = if self.source_isolation_root.is_none()
+            && let Some(folder) = settings.sync_folder_path.as_deref()
+        {
+            TokenSyncStore::new(folder, local_device.clone())
+                .with_cache(&cache)
+                .cached_outcome(event_after)
+        } else {
+            None
+        };
+        let scanner =
+            TokenLogScanner::new(self.scanner_roots(settings), local_device, Some(&cache));
+        let mut scan = scanner.cached_result(event_after).unwrap_or_default();
+        if let Some(sync) = sync {
+            scan.events = merge_local_and_sync(scan.events, sync.events);
+            scan.sync_status = sync.status;
+            scan.sync_devices = devices(&scan.events);
+        }
+        Ok(scan)
     }
 
     fn scan(
         &self,
         settings: &TokenMeterSettings,
         rebuild_cache: bool,
+        modified_after: Option<chrono::DateTime<Utc>>,
+        event_after: Option<chrono::DateTime<Utc>>,
+        synchronize_sync: bool,
+        is_cancelled: impl Fn() -> bool,
     ) -> Result<token_meter_core::models::ScanResult, String> {
         let cache = TokenEventCache::open_or_create(&self.cache_path()).map_err(string_error)?;
         let local_device = TokenDeviceMetadata::new(
@@ -410,18 +533,46 @@ impl TokenMeterState {
         if rebuild_cache {
             scanner.clear_cache().map_err(string_error)?;
         }
-        let mut scan = scanner.scan(None, None, || false);
-        if self.source_isolation_root.is_none()
-            && let Some(folder) = settings.sync_folder_path.as_deref()
-        {
+        let sync_store = (synchronize_sync && self.source_isolation_root.is_none())
+            .then_some(settings.sync_folder_path.as_deref())
+            .flatten()
+            .map(|folder| TokenSyncStore::new(folder, local_device.clone()).with_cache(&cache));
+        let force_full_export = if !rebuild_cache && modified_after.is_some() {
+            sync_store.as_ref().is_some_and(|store| {
+                store
+                    .local_ledger_needs_full_export(&is_cancelled)
+                    .unwrap_or(false)
+            })
+        } else {
+            false
+        };
+        let mut scan = scanner.scan(
+            if force_full_export {
+                None
+            } else {
+                modified_after
+            },
+            if force_full_export { None } else { event_after },
+            &is_cancelled,
+        );
+        if is_cancelled() {
+            return Err(DASHBOARD_REFRESH_CANCELLED.to_owned());
+        }
+        if let Some(sync_store) = sync_store {
             let scan_complete = scan.parse_error_count == 0;
-            let outcome = TokenSyncStore::new(folder, local_device.clone()).synchronize(
+            let outcome = sync_store.synchronize(
                 if scan_complete { &scan.events } else { &[] },
-                rebuild_cache && scan_complete,
-                None,
-                || false,
+                (rebuild_cache || force_full_export) && scan_complete,
+                event_after,
+                &is_cancelled,
             );
+            if is_cancelled() {
+                return Err(DASHBOARD_REFRESH_CANCELLED.to_owned());
+            }
             let mut outcome = outcome;
+            if force_full_export && let Some(cutoff) = event_after {
+                scan.events.retain(|event| event.timestamp >= cutoff);
+            }
             if !scan_complete {
                 outcome.status.export_error = Some(
                     "Local sync export was skipped because token source scanning was incomplete."
@@ -525,11 +676,13 @@ impl TokenMeterState {
             .map_err(string_error)?;
         let result = remove_cleanup_sources(&codex_home, &destination, &evidence, &authorization)
             .map_err(string_error)?;
-        let scan = self.scan(&settings, false)?;
-        self.dashboard_data
+        let scan = self.scan(&settings, false, None, None, true, || false)?;
+        let mut data = self
+            .dashboard_data
             .lock()
-            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?
-            .scan = Some(scan);
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+        data.scan = Some(scan);
+        data.loaded_after = None;
         Ok(CleanupApplyResult {
             archived_count: result.archived_file_count,
         })
@@ -554,7 +707,7 @@ impl TokenMeterState {
         })?;
         let codex_home = fs::canonicalize(codex_home)
             .map_err(|_| "The configured Codex home is unavailable.".to_owned())?;
-        let scan = self.scan(settings, false)?;
+        let scan = self.scan(settings, false, None, None, true, || false)?;
         if !scan.sync_status.exists
             || scan.sync_status.export_error.is_some()
             || scan.sync_status.parse_error_count != 0
@@ -787,6 +940,17 @@ fn cleanup_archive_path(codex_home: &Path, retention_days: u32) -> PathBuf {
     ))
 }
 
+fn window_covers(
+    loaded_after: Option<chrono::DateTime<Utc>>,
+    required_after: Option<chrono::DateTime<Utc>>,
+) -> bool {
+    match (loaded_after, required_after) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(loaded), Some(required)) => loaded <= required,
+    }
+}
+
 fn devices(events: &[token_meter_core::models::TokenEvent]) -> Vec<TokenDeviceMetadata> {
     events
         .iter()
@@ -972,9 +1136,10 @@ fn current_first_weekday() -> Result<Weekday, String> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs::FileTimes,
         sync::mpsc::{self, RecvTimeoutError},
         thread,
-        time::Duration,
+        time::{Duration, SystemTime},
     };
 
     use super::*;
@@ -982,8 +1147,10 @@ mod tests {
     fn state(root: &Path) -> TokenMeterState {
         TokenMeterState {
             operation: Mutex::new(()),
+            scan_generation: AtomicU64::new(0),
             dashboard_data: Arc::new(Mutex::new(DashboardData {
                 scan: None,
+                loaded_after: None,
                 account: DashboardAccountState::Updating(None),
                 account_generation: 0,
             })),
@@ -998,25 +1165,44 @@ mod tests {
         }
     }
 
+    fn write_codex_session(path: &Path, timestamp: &str, input: i64) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let value = serde_json::json!({
+            "timestamp": timestamp,
+            "payload": {
+                "cwd": "/tmp/project",
+                "model": "gpt",
+                "info": {
+                    "last_token_usage": {"input_tokens": input, "total_tokens": input},
+                    "total_token_usage": {"input_tokens": input, "total_tokens": input},
+                },
+            },
+        });
+        fs::write(path, format!("{value}\n")).unwrap();
+    }
+
     #[test]
-    fn filter_dashboard_uses_cached_scan_until_refresh_is_requested() {
+    fn cached_dashboard_is_immediate_and_refresh_adds_new_events() {
         use token_meter_core::{dashboard::DashboardFilters, models::TokenSource};
 
         let directory = tempfile::tempdir().unwrap();
         let state = state(directory.path());
-        state.dashboard_data.lock().unwrap().scan = Some(ScanResult::default());
-        let session = state.home_dir.join(".codex/sessions/2026/session.jsonl");
-        fs::create_dir_all(session.parent().unwrap()).unwrap();
-        fs::write(
-            session,
-            concat!(
-                "{\"timestamp\":\"2026-01-01T00:00:00.000Z\",",
-                "\"payload\":{\"cwd\":\"/tmp/project\",\"model\":\"gpt\",",
-                "\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"total_tokens\":10},",
-                "\"total_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n"
-            ),
-        )
-        .unwrap();
+        let sessions = state.home_dir.join(".codex/sessions/2026");
+        write_codex_session(
+            &sessions.join("cached.jsonl"),
+            "2026-01-01T00:00:00.000Z",
+            10,
+        );
+        let settings = state.load_settings().unwrap();
+        assert_eq!(
+            state
+                .scan(&settings, false, None, None, true, || false)
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        write_codex_session(&sessions.join("new.jsonl"), "2026-01-02T00:00:00.000Z", 20);
         let request = DashboardRequest {
             source: TokenSource::All,
             range: "All".into(),
@@ -1024,9 +1210,190 @@ mod tests {
             filters: DashboardFilters::default(),
         };
 
-        assert_eq!(state.dashboard(&request, false).unwrap().event_count, 0);
-        let refreshed = state.dashboard(&request, true).unwrap();
-        assert_eq!(refreshed.event_count, 1);
+        assert_eq!(
+            state
+                .dashboard(&request, false, state.scan_epoch())
+                .unwrap()
+                .event_count,
+            1
+        );
+        let refreshed = state.dashboard(&request, true, state.scan_epoch()).unwrap();
+        assert_eq!(refreshed.event_count, 2);
+    }
+
+    #[test]
+    fn first_dashboard_paints_an_empty_cache_before_scanning_sources() {
+        use token_meter_core::{dashboard::DashboardFilters, models::TokenSource};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        write_codex_session(
+            &state.home_dir.join(".codex/sessions/local.jsonl"),
+            "2026-01-01T00:00:00.000Z",
+            10,
+        );
+        let sync = directory.path().join("sync");
+        let ledger = sync.join("devices/remote.jsonl");
+        fs::create_dir_all(ledger.parent().unwrap()).unwrap();
+        fs::write(&ledger, "not json\n").unwrap();
+        let mut settings = state.load_settings().unwrap();
+        settings.sync_folder_path = Some(sync.to_string_lossy().into_owned());
+        settings.save(&state.settings_path()).unwrap();
+        let request = DashboardRequest {
+            source: TokenSource::All,
+            range: "All".into(),
+            bucket: "auto".into(),
+            filters: DashboardFilters::default(),
+        };
+
+        let dashboard = state
+            .dashboard(&request, false, state.scan_epoch())
+            .unwrap();
+
+        assert_eq!(dashboard.event_count, 0);
+        let cache = TokenEventCache::open_or_create(&state.cache_path()).unwrap();
+        assert!(
+            cache
+                .origin_file(
+                    OriginKind::SyncLedger,
+                    &ledger.canonicalize().unwrap().to_string_lossy(),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state
+                .dashboard(&request, true, state.scan_epoch())
+                .unwrap()
+                .event_count,
+            1
+        );
+    }
+
+    #[test]
+    fn disabling_sync_keeps_ledger_cache_for_reenable() {
+        use chrono::TimeZone;
+        use token_meter_core::{
+            models::{TokenSource, TokenUsage},
+            sync::{SyncLedgerRecord, rewrite_local_ledger_v2},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let sync = directory.path().join("sync");
+        let ledger = sync.join("devices/remote.jsonl");
+        fs::create_dir(&sync).unwrap();
+        rewrite_local_ledger_v2(
+            &ledger,
+            [SyncLedgerRecord::v2(
+                "remote".into(),
+                "Remote".into(),
+                "event".into(),
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                TokenSource::Codex,
+                "gpt".into(),
+                "/project",
+                "session",
+                TokenUsage::default(),
+            )],
+        )
+        .unwrap();
+        let mut settings = state.load_settings().unwrap();
+        settings.sync_folder_path = Some(sync.to_string_lossy().into_owned());
+        state
+            .scan(&settings, false, None, None, true, || false)
+            .unwrap();
+        let cache = TokenEventCache::open_or_create(&state.cache_path()).unwrap();
+        let key = ledger
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            cache
+                .origin_file(OriginKind::SyncLedger, &key)
+                .unwrap()
+                .is_some()
+        );
+
+        settings.sync_folder_path = None;
+        state
+            .scan(&settings, false, None, None, true, || false)
+            .unwrap();
+
+        assert!(
+            cache
+                .origin_file(OriginKind::SyncLedger, &key)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn expanding_to_all_scans_old_uncached_files() {
+        use token_meter_core::{dashboard::DashboardFilters, models::TokenSource};
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let loaded_after = Utc::now() - ChronoDuration::hours(16);
+        {
+            let mut data = state.dashboard_data.lock().unwrap();
+            data.scan = Some(ScanResult::default());
+            data.loaded_after = Some(loaded_after);
+        }
+        let session = state.home_dir.join(".codex/sessions/old.jsonl");
+        write_codex_session(&session, "2025-01-01T00:00:00.000Z", 10);
+        let old = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 30);
+        OpenOptions::new()
+            .write(true)
+            .open(&session)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+        let request = DashboardRequest {
+            source: TokenSource::All,
+            range: "All".into(),
+            bucket: "auto".into(),
+            filters: DashboardFilters::default(),
+        };
+
+        let dashboard = state
+            .dashboard(&request, false, state.scan_epoch())
+            .unwrap();
+
+        assert_eq!(dashboard.event_count, 1);
+        assert_eq!(state.dashboard_data.lock().unwrap().loaded_after, None);
+    }
+
+    #[test]
+    fn cancelled_refresh_preserves_the_previous_dashboard() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let loaded_after = Utc::now() - ChronoDuration::hours(16);
+        {
+            let mut data = state.dashboard_data.lock().unwrap();
+            data.scan = Some(ScanResult::default());
+            data.loaded_after = Some(loaded_after);
+        }
+        let scan_epoch = state.scan_epoch();
+        state.cancel_scan();
+        let settings = state.load_settings().unwrap();
+
+        let error = state
+            .refresh_dashboard_data(
+                &settings,
+                false,
+                Some(Utc::now() - ChronoDuration::hours(48)),
+                Some(loaded_after),
+                true,
+                || !state.scan_is_current(scan_epoch),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, DASHBOARD_REFRESH_CANCELLED);
+        let data = state.dashboard_data.lock().unwrap();
+        assert!(data.scan.is_some());
+        assert_eq!(data.loaded_after, Some(loaded_after));
     }
 
     #[test]
@@ -1067,7 +1434,9 @@ mod tests {
         let settings = state.load_settings().unwrap();
 
         let started = Instant::now();
-        state.refresh_dashboard_data(&settings, false).unwrap();
+        state
+            .refresh_dashboard_data(&settings, false, None, None, true, || false)
+            .unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
@@ -1238,7 +1607,7 @@ mod tests {
         assert!(state.cleanup_proofs(&settings).is_err());
         assert!(
             state
-                .scan(&settings, false)
+                .scan(&settings, false, None, None, true, || false)
                 .unwrap()
                 .sync_status
                 .path
@@ -1260,7 +1629,7 @@ mod tests {
         .unwrap();
 
         let dashboard = state
-            .with_lock(|state| state.dashboard(&request, false))
+            .with_lock(|state| state.dashboard(&request, false, state.scan_epoch()))
             .unwrap();
 
         assert_eq!(dashboard.total.total, "0");
@@ -1481,7 +1850,9 @@ mod tests {
         .unwrap();
         let before = fs::read(store.local_ledger_path()).unwrap();
 
-        let scan = state.scan(&settings, true).unwrap();
+        let scan = state
+            .scan(&settings, true, None, None, true, || false)
+            .unwrap();
 
         assert!(scan.parse_error_count > 0);
         assert_eq!(fs::read(store.local_ledger_path()).unwrap(), before);
@@ -1497,6 +1868,46 @@ mod tests {
                 .iter()
                 .any(|event| event.id == "preserved-event")
         );
+    }
+
+    #[test]
+    fn windowed_refresh_exports_full_history_when_local_ledger_is_missing() {
+        use token_meter_core::sync::read_ledger;
+
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let session = state.home_dir.join(".codex/sessions/old.jsonl");
+        let sync = directory.path().join("sync");
+        fs::create_dir(&sync).unwrap();
+        write_codex_session(&session, "2026-01-01T00:00:00.000Z", 10);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&session)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(30 * 86_400)),
+            )
+            .unwrap();
+        let mut settings = state.load_settings().unwrap();
+        settings.sync_folder_path = Some(sync.to_string_lossy().into_owned());
+        settings.save(&state.settings_path()).unwrap();
+        let cutoff = Utc::now() - ChronoDuration::hours(8);
+
+        let scan = state
+            .scan(&settings, false, Some(cutoff), Some(cutoff), true, || false)
+            .unwrap();
+        let ledger = TokenSyncStore::new(
+            &sync,
+            TokenDeviceMetadata::new(
+                settings.local_device_id.clone(),
+                state.local_device_name.clone(),
+            ),
+        )
+        .local_ledger_path();
+
+        assert_eq!(read_ledger(&ledger, None).unwrap().records.len(), 1);
+        assert!(scan.events.iter().all(|event| event.timestamp >= cutoff));
     }
 
     #[test]
@@ -1566,7 +1977,7 @@ mod tests {
         let settings = state.load_settings().unwrap();
         assert_eq!(
             state
-                .scan(&settings, false)
+                .scan(&settings, false, None, None, true, || false)
                 .unwrap()
                 .events
                 .iter()

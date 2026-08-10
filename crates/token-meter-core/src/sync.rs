@@ -80,6 +80,9 @@ impl SyncLedgerRecord {
 pub struct LedgerRead {
     pub records: Vec<SyncLedgerRecord>,
     pub parse_error_count: usize,
+    pub file_size: u64,
+    pub modified_at: Option<SystemTime>,
+    pub file_identity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -94,27 +97,145 @@ pub fn read_ledger(
     if !path.exists() {
         return Ok(LedgerRead::default());
     }
-    with_ledger_lock(path, |_| read_ledger_unlocked(path, imported_after))
+    let mut is_cancelled = || false;
+    with_ledger_lock(path, |_| {
+        read_ledger_unlocked(path, 0, imported_after, &mut is_cancelled)
+    })
+}
+
+pub fn read_ledger_cancelable(
+    path: &Path,
+    offset: u64,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<LedgerRead, SyncError> {
+    with_ledger_lock(path, |_| {
+        read_ledger_unlocked(path, offset, None, &mut is_cancelled)
+    })
+}
+
+pub(crate) fn verified_ledger_snapshot(
+    path: &Path,
+) -> Result<(PathBuf, u64, SystemTime, String), SyncError> {
+    verified_ledger_snapshot_with(path, || Ok(()))
+}
+
+pub(crate) fn verified_direct_ledger_paths(devices: &Path) -> io::Result<Vec<PathBuf>> {
+    verified_direct_ledger_paths_with(devices, || Ok(()))
+}
+
+fn verified_direct_ledger_paths_with(
+    devices: &Path,
+    after_validation: impl FnOnce() -> io::Result<()>,
+) -> io::Result<Vec<PathBuf>> {
+    let probe = devices.join(".enumeration");
+    let boundary = match LedgerBoundary::open_existing(&probe) {
+        Ok(boundary) => boundary,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let root = devices.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "sync root is missing")
+            })?;
+            let (_root_file, root_identity) = open_directory_nofollow(root)?;
+            ensure_path_identity(devices, None)?;
+            ensure_node_identity(root, NodeKind::Directory, root_identity)?;
+            ensure_path_identity(devices, None)?;
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error),
+    };
+    boundary.validate(&probe)?;
+    after_validation()?;
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(devices)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.')
+            && entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            && entry.file_type()?.is_file()
+        {
+            paths.push(entry.path());
+        }
+    }
+    boundary.validate(&probe)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn verified_ledger_snapshot_with(
+    path: &Path,
+    after_open: impl FnOnce() -> io::Result<()>,
+) -> Result<(PathBuf, u64, SystemTime, String), SyncError> {
+    let boundary = LedgerBoundary::open_existing(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let (file, identity) = open_regular_nofollow(path, &mut options)?;
+    after_open()?;
+    boundary.validate_target(path, Some(identity))?;
+    let canonical = fs::canonicalize(path)?;
+    let metadata = file.metadata()?;
+    boundary.validate_target(path, Some(identity))?;
+    Ok((
+        canonical,
+        metadata.len(),
+        metadata.modified()?,
+        identity.cache_token(),
+    ))
 }
 
 fn read_ledger_unlocked(
     path: &Path,
+    offset: u64,
     imported_after: Option<DateTime<Utc>>,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<LedgerRead, SyncError> {
     let mut options = OpenOptions::new();
     options.read(true);
     let (mut file, _) = open_regular_nofollow(path, &mut options)?;
-    read_ledger_file(&mut file, imported_after)
+    read_ledger_file(&mut file, offset, imported_after, is_cancelled)
 }
 
 fn read_ledger_file(
     file: &mut fs::File,
+    offset: u64,
     imported_after: Option<DateTime<Utc>>,
+    is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<LedgerRead, SyncError> {
-    file.seek(SeekFrom::Start(0))?;
+    let metadata = file.metadata()?;
+    let file_identity = node_identity(file, NodeKind::File)?.cache_token();
+    if offset > metadata.len() {
+        return Err(SyncError::RequiresFullRead);
+    }
+    let mut start = offset;
+    if offset > 0 {
+        let mut boundary = [0];
+        if offset < metadata.len() {
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut boundary)?;
+            if boundary[0] == b'\n' {
+                start += 1;
+            } else {
+                file.seek(SeekFrom::Start(offset - 1))?;
+                file.read_exact(&mut boundary)?;
+                if boundary[0] != b'\n' {
+                    return Err(SyncError::RequiresFullRead);
+                }
+            }
+        } else {
+            file.seek(SeekFrom::Start(offset - 1))?;
+            file.read_exact(&mut boundary)?;
+            if boundary[0] != b'\n' {
+                return Err(SyncError::RequiresFullRead);
+            }
+        }
+    }
+    file.seek(SeekFrom::Start(start))?;
     let mut records = Vec::new();
     let mut parse_error_count = 0;
     for line in BufReader::new(file).lines() {
+        if is_cancelled() {
+            return Err(SyncError::Cancelled);
+        }
         let line = match line {
             Ok(line) => line,
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
@@ -143,29 +264,50 @@ fn read_ledger_file(
     Ok(LedgerRead {
         records,
         parse_error_count,
+        file_size: metadata.len(),
+        modified_at: metadata.modified().ok(),
+        file_identity: Some(file_identity),
     })
 }
 
 pub fn requires_local_ledger_replacement(path: &Path) -> Result<bool, SyncError> {
+    requires_local_ledger_replacement_cancelable(path, || false)
+}
+
+pub fn requires_local_ledger_replacement_cancelable(
+    path: &Path,
+    mut is_cancelled: impl FnMut() -> bool,
+) -> Result<bool, SyncError> {
     if !path.exists() {
         return Ok(true);
     }
-    with_ledger_lock(path, |_| requires_local_ledger_replacement_unlocked(path))
+    with_ledger_lock(path, |_| {
+        requires_local_ledger_replacement_unlocked(path, &mut is_cancelled)
+    })
 }
 
-fn requires_local_ledger_replacement_unlocked(path: &Path) -> Result<bool, SyncError> {
+fn requires_local_ledger_replacement_unlocked(
+    path: &Path,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, SyncError> {
     let mut options = OpenOptions::new();
     options.read(true);
     let (mut file, _) = open_regular_nofollow(path, &mut options)?;
-    requires_local_ledger_replacement_file(&mut file)
+    requires_local_ledger_replacement_file(&mut file, is_cancelled)
 }
 
-fn requires_local_ledger_replacement_file(file: &mut fs::File) -> Result<bool, SyncError> {
+fn requires_local_ledger_replacement_file(
+    file: &mut fs::File,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<bool, SyncError> {
     file.seek(SeekFrom::Start(0))?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut replace = false;
     while reader.read_until(b'\n', &mut line)? != 0 {
+        if is_cancelled() {
+            return Err(SyncError::Cancelled);
+        }
         if let Ok(schema) = serde_json::from_slice::<LedgerSchema>(&line) {
             if schema.schema_version > SYNC_SCHEMA_VERSION {
                 return Err(SyncError::UnsupportedSchemaVersion {
@@ -188,23 +330,42 @@ pub fn write_local_ledger_v2(
     path: &Path,
     records: impl IntoIterator<Item = SyncLedgerRecord>,
     replace_existing: bool,
-    is_cancelled: impl FnOnce() -> bool,
+    is_cancelled: impl FnMut() -> bool,
+) -> Result<usize, SyncError> {
+    write_local_ledger_v2_cached(path, records, replace_existing, None, is_cancelled)
+}
+
+pub fn write_local_ledger_v2_cached(
+    path: &Path,
+    records: impl IntoIterator<Item = SyncLedgerRecord>,
+    replace_existing: bool,
+    cached: Option<(u64, f64, String, HashSet<String>)>,
+    mut is_cancelled: impl FnMut() -> bool,
 ) -> Result<usize, SyncError> {
     with_ledger_lock(path, |boundary| {
         let records = sorted_v2_records(records)?;
         if records.is_empty() {
             return Ok(0);
         }
-        let (existing, replace_legacy) = local_ledger_state(path)?;
+        if !replace_existing && let Some(cached) = cached {
+            return append_new_v2_records_unlocked(
+                path,
+                records,
+                Some(cached),
+                &mut is_cancelled,
+                boundary,
+            );
+        }
+        let (existing, replace_legacy) = local_ledger_state(path, &mut is_cancelled)?;
         if replace_existing || replace_legacy {
             if is_cancelled() {
-                return Ok(0);
+                return Err(SyncError::Cancelled);
             }
             rewrite_local_ledger_v2_unlocked(path, &records, existing, boundary)?;
             Ok(records.len())
         } else {
             drop(existing);
-            append_new_v2_records_unlocked(path, records, is_cancelled, boundary)
+            append_new_v2_records_unlocked(path, records, None, &mut is_cancelled, boundary)
         }
     })
 }
@@ -218,7 +379,7 @@ pub fn rewrite_local_ledger_v2(
         return Ok(0);
     }
     with_ledger_lock(path, |boundary| {
-        let (existing, _) = local_ledger_state(path)?;
+        let (existing, _) = local_ledger_state(path, &mut || false)?;
         rewrite_local_ledger_v2_unlocked(path, &records, existing, boundary)
     })?;
     Ok(records.len())
@@ -537,32 +698,37 @@ pub fn append_new_v2_records(
 ) -> Result<usize, SyncError> {
     let candidates = sorted_v2_records(candidates)?;
     with_ledger_lock(path, |boundary| {
-        append_new_v2_records_unlocked(path, candidates, || false, boundary)
+        append_new_v2_records_unlocked(path, candidates, None, &mut || false, boundary)
     })
 }
 
-fn append_new_v2_records_unlocked<F>(
+fn append_new_v2_records_unlocked(
     path: &Path,
     candidates: Vec<SyncLedgerRecord>,
-    is_cancelled: F,
+    cached: Option<(u64, f64, String, HashSet<String>)>,
+    is_cancelled: &mut impl FnMut() -> bool,
     boundary: &LedgerBoundary,
-) -> Result<usize, SyncError>
-where
-    F: FnOnce() -> bool,
-{
+) -> Result<usize, SyncError> {
     let mut options = OpenOptions::new();
     options.read(true).append(true);
     let mut file = open_optional_regular_nofollow(path, &mut options)?;
     let existing_keys = if let Some((file, identity)) = file.as_mut() {
         boundary.validate_target(path, Some(*identity))?;
-        if requires_local_ledger_replacement_file(file)? {
-            return Err(SyncError::LegacyLedgerRequiresReplacement);
+        if let Some((size, modified_at, cached_identity, keys)) = cached
+            && metadata_matches(&file.metadata()?, size, modified_at)
+            && identity.cache_token() == cached_identity
+        {
+            keys
+        } else {
+            if requires_local_ledger_replacement_file(file, &mut *is_cancelled)? {
+                return Err(SyncError::LegacyLedgerRequiresReplacement);
+            }
+            read_ledger_file(file, 0, None, &mut *is_cancelled)?
+                .records
+                .into_iter()
+                .map(|record| record.identity_key())
+                .collect::<HashSet<_>>()
         }
-        read_ledger_file(file, None)?
-            .records
-            .into_iter()
-            .map(|record| record.identity_key())
-            .collect::<HashSet<_>>()
     } else {
         HashSet::new()
     };
@@ -574,7 +740,7 @@ where
         return Ok(0);
     }
     if is_cancelled() {
-        return Ok(0);
+        return Err(SyncError::Cancelled);
     }
     let (mut file, identity) = match file {
         Some((file, identity)) => (file, identity),
@@ -600,6 +766,15 @@ where
     file.sync_data()?;
     boundary.validate_target(path, Some(identity))?;
     Ok(candidates.len())
+}
+
+fn metadata_matches(metadata: &fs::Metadata, size: u64, modified_at: f64) -> bool {
+    metadata.len() == size
+        && metadata.modified().is_ok_and(|modified| {
+            modified
+                .duration_since(UNIX_EPOCH)
+                .is_ok_and(|value| (value.as_secs_f64() - modified_at).abs() < 0.000_001)
+        })
 }
 
 pub fn privacy_hash(value: &str) -> String {
@@ -673,6 +848,12 @@ fn write_lines(writer: &mut impl Write, records: &[SyncLedgerRecord]) -> Result<
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity(u64, u64);
 
+impl FileIdentity {
+    fn cache_token(self) -> String {
+        format!("{:016x}:{:016x}", self.0, self.1)
+    }
+}
+
 struct OpenedLedger {
     file: fs::File,
     identity: FileIdentity,
@@ -697,6 +878,14 @@ struct LedgerBoundary {
 
 impl LedgerBoundary {
     fn open(ledger_path: &Path) -> io::Result<Self> {
+        Self::open_with(ledger_path, true)
+    }
+
+    fn open_existing(ledger_path: &Path) -> io::Result<Self> {
+        Self::open_with(ledger_path, false)
+    }
+
+    fn open_with(ledger_path: &Path, create_devices: bool) -> io::Result<Self> {
         let devices_path = ledger_path.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -716,10 +905,12 @@ impl LedgerBoundary {
 
         let (root_file, root_identity) = open_directory_nofollow(root_path)?;
         ensure_node_identity(root_path, NodeKind::Directory, root_identity)?;
-        match fs::create_dir(devices_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+        if create_devices {
+            match fs::create_dir(devices_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
         }
         ensure_node_identity(root_path, NodeKind::Directory, root_identity)?;
         let (devices_file, devices_identity) = open_directory_nofollow(devices_path)?;
@@ -783,11 +974,14 @@ impl LedgerBoundary {
     }
 }
 
-fn local_ledger_state(path: &Path) -> Result<(Option<OpenedLedger>, bool), SyncError> {
+fn local_ledger_state(
+    path: &Path,
+    is_cancelled: &mut impl FnMut() -> bool,
+) -> Result<(Option<OpenedLedger>, bool), SyncError> {
     let Some(mut opened) = open_optional_regular_replace_probe(path)? else {
         return Ok((None, false));
     };
-    let replace = requires_local_ledger_replacement_file(&mut opened.file)?;
+    let replace = requires_local_ledger_replacement_file(&mut opened.file, is_cancelled)?;
     Ok((Some(opened), replace))
 }
 
@@ -1145,6 +1339,10 @@ pub enum SyncError {
     MissingIdentity,
     #[error("schema v1 local ledger must be replaced before appending")]
     LegacyLedgerRequiresReplacement,
+    #[error("sync ledger changed incompatibly with its cached prefix")]
+    RequiresFullRead,
+    #[error("sync ledger read was cancelled")]
+    Cancelled,
     #[error(
         "sync ledger schema version {found} is unsupported; this app supports up to version {supported}"
     )]
@@ -1248,7 +1446,7 @@ mod tests {
         let replacement = sorted_v2_records([record("mac-a", "new", 2)]).unwrap();
 
         let result = with_ledger_lock(&path, |boundary| {
-            let (existing, _) = local_ledger_state(&path)?;
+            let (existing, _) = local_ledger_state(&path, &mut || false)?;
             rewrite_local_ledger_v2_unlocked_with(&path, &replacement, existing, boundary, || {
                 fs::rename(&path, &moved)?;
                 fs::write(&path, b"competing destination\n")?;
@@ -1309,7 +1507,7 @@ mod tests {
         let replacement = sorted_v2_records([record("mac-a", "new", 2)]).unwrap();
 
         let error = with_ledger_lock(&path, |boundary| {
-            let (existing, _) = local_ledger_state(&path)?;
+            let (existing, _) = local_ledger_state(&path, &mut || false)?;
             rewrite_local_ledger_v2_unlocked_with(&path, &replacement, existing, boundary, || {
                 Err(map_race_safe_rename_error(io::Error::from_raw_os_error(libc::ENOTSUP)).into())
             })
@@ -1388,6 +1586,63 @@ mod tests {
     }
 
     #[test]
+    fn tail_read_accepts_newline_inserted_at_the_cached_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/mac-a.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec(&record("mac-a", "old", 1)).unwrap();
+        fs::write(&path, &original).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"\n").unwrap();
+        write_lines(&mut file, &[record("mac-a", "new", 1)]).unwrap();
+        file.sync_all().unwrap();
+
+        let tail = read_ledger_cancelable(&path, original.len() as u64, || false).unwrap();
+
+        assert_eq!(tail.records.len(), 1);
+        assert_eq!(tail.records[0].event_id, "new");
+    }
+
+    #[test]
+    fn ledger_read_stops_between_lines_when_cancelled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/mac-a.jsonl");
+        let records = (0..100)
+            .map(|index| record("mac-a", &index.to_string(), 1))
+            .collect::<Vec<_>>();
+        rewrite_local_ledger_v2(&path, records).unwrap();
+        let checks = std::cell::Cell::new(0);
+
+        let result = read_ledger_cancelable(&path, 0, || {
+            checks.set(checks.get() + 1);
+            checks.get() == 5
+        });
+
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+    }
+
+    #[test]
+    fn writer_fallback_stops_between_existing_lines_without_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("devices/mac-a.jsonl");
+        rewrite_local_ledger_v2(
+            &path,
+            (0..100).map(|index| record("mac-a", &index.to_string(), 1)),
+        )
+        .unwrap();
+        let before = fs::read(&path).unwrap();
+        let checks = std::cell::Cell::new(0);
+
+        let result = write_local_ledger_v2(&path, [record("mac-a", "new", 1)], false, || {
+            checks.set(checks.get() + 1);
+            checks.get() == 5
+        });
+
+        assert!(matches!(result, Err(SyncError::Cancelled)));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn normalizes_legacy_usage_and_preserves_unicode_device_file_names() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("devices/legacy.jsonl");
@@ -1451,9 +1706,13 @@ mod tests {
         let a_inside_thread = Arc::clone(&a_inside);
         let release_a_thread = Arc::clone(&release_a);
         let host_a = std::thread::spawn(move || {
+            let mut paused = false;
             write_local_ledger_v2(&path_a, [record("mac-a", "old", 1)], false, || {
-                a_inside_thread.wait();
-                release_a_thread.wait();
+                if !paused {
+                    paused = true;
+                    a_inside_thread.wait();
+                    release_a_thread.wait();
+                }
                 false
             })
             .unwrap();
@@ -1598,6 +1857,54 @@ mod tests {
         fs::write(&path, b"replacement").unwrap();
 
         assert!(boundary.validate_target(&path, Some(identity)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_snapshot_rejects_a_ledger_symlink_swap_without_creating_a_lock() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let empty_root = directory.path().join("empty");
+        let missing = empty_root.join("devices/missing.jsonl");
+        fs::create_dir(&empty_root).unwrap();
+        assert!(verified_ledger_snapshot(&missing).is_err());
+        assert!(!empty_root.join("devices").exists());
+
+        let path = directory.path().join("sync/devices/mac-a.jsonl");
+        let outside = directory.path().join("outside.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"original").unwrap();
+        fs::write(&outside, b"outside").unwrap();
+
+        let result = verified_ledger_snapshot_with(&path, || {
+            fs::rename(&path, path.with_extension("moved"))?;
+            symlink(&outside, &path)
+        });
+
+        assert!(result.is_err());
+        assert!(!ledger_lock_path(&path).exists());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_enumeration_rejects_an_empty_devices_directory_swap() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let devices = root.join("devices");
+        let moved = root.join("moved-devices");
+        fs::create_dir_all(&devices).unwrap();
+        fs::write(devices.join("remote.jsonl"), b"event").unwrap();
+
+        let result = verified_direct_ledger_paths_with(&devices, || {
+            fs::rename(&devices, &moved)?;
+            fs::create_dir(&devices)
+        });
+
+        assert!(result.is_err());
+        assert!(devices.read_dir().unwrap().next().is_none());
+        assert!(moved.join("remote.jsonl").exists());
     }
 
     #[test]
