@@ -2,14 +2,14 @@ import {
   ArrowClockwise,
   ArrowDown,
   ArrowUp,
+  Broadcast,
+  CaretRight,
   CheckCircle,
   Circle,
   Code,
   Cube,
-  DownloadSimple,
   FileText,
   FolderPlus,
-  Gear,
   GitBranch,
   HardDrive,
   Hash,
@@ -54,7 +54,7 @@ type RuntimeAtlasUpdate = {
   onInstall: () => void;
 };
 
-export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
+export function RuntimeAtlas({ update, active }: { update?: RuntimeAtlasUpdate; active: boolean }) {
   const [snapshot, setSnapshot] = useState<RuntimeAtlasSnapshot>();
   const [selectedPath, setSelectedPath] = useState<string>();
   const [error, setError] = useState<string>();
@@ -66,37 +66,64 @@ export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
   const selectedPathRef = useRef<string | undefined>(undefined);
   const navigationStartPath = useRef<string | undefined>(undefined);
   const navigationQueue = useRef<Promise<void>>(Promise.resolve());
+  const busyGate = useRef({ tail: Promise.resolve(), pending: 0 });
   const sidebar = useRef<HTMLElement>(null);
+  const sidebarDrag = useRef<{ x: number; width: number } | undefined>(undefined);
   const [sidebarWidth, setSidebarWidth] = useState(360);
 
-  const refresh = useCallback(async () => {
+  const enqueue = useCallback(<T,>(operation: () => Promise<T>) => {
+    const gate = busyGate.current;
+    gate.pending += 1;
     setBusy(true);
-    try {
-      const status = await runtimeAtlasCommands.status();
-      setSnapshot(status);
-      setSelectedPath((current) =>
-        current && status.repositories.some((repository) =>
-          repository.worktrees.some((worktree) => worktree.path === current))
-          ? current
-          : status.repositories.flatMap((repository) => repository.worktrees)[0]?.path,
-      );
-      setError(undefined);
-    } catch (reason) {
-      setError(String(reason));
-    } finally {
-      setBusy(false);
-    }
+    const result = gate.tail.then(operation, operation);
+    gate.tail = result.then(() => undefined, () => undefined);
+    return result.finally(() => {
+      gate.pending -= 1;
+      if (gate.pending === 0) setBusy(false);
+    });
   }, []);
 
+  const loadStatus = useCallback(async () => {
+    const status = await runtimeAtlasCommands.status();
+    setSnapshot(status);
+    setSelectedPath((current) =>
+      current && status.repositories.some((repository) =>
+        repository.worktrees.some((worktree) => worktree.path === current))
+        ? current
+        : status.repositories.flatMap((repository) => repository.worktrees)[0]?.path,
+    );
+  }, []);
+
+  const refresh = useCallback(() => {
+    if (busyGate.current.pending > 0) return Promise.resolve(false);
+    return enqueue(async () => {
+      try {
+        await loadStatus();
+        setError(undefined);
+        return true;
+      } catch (reason) {
+        setError(String(reason));
+        return false;
+      }
+    });
+  }, [enqueue, loadStatus]);
+
   useEffect(() => {
+    if (!active) return;
     void refresh();
     const timer = window.setInterval(() => void refresh(), 60_000);
     return () => window.clearInterval(timer);
-  }, [refresh]);
+  }, [active, refresh]);
 
   useEffect(() => {
     selectedPathRef.current = selectedPath;
   }, [selectedPath]);
+
+  useEffect(() => {
+    const openSettings = () => setShowingSettings(true);
+    window.addEventListener("runtime-atlas:open-settings", openSettings);
+    return () => window.removeEventListener("runtime-atlas:open-settings", openSettings);
+  }, []);
 
   useEffect(() => {
     const element = sidebar.current;
@@ -150,18 +177,13 @@ export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
     };
   }, []);
 
-  const mutate = async (operation: () => Promise<unknown>) => {
-    setBusy(true);
-    try {
-      await operation();
-      await refresh();
-      return true;
-    } catch (reason) {
-      setError(String(reason));
-      setBusy(false);
-      return false;
-    }
-  };
+  const mutate = (operation: () => Promise<unknown>) => enqueue(async () => {
+    let failure: unknown;
+    try { await operation(); } catch (reason) { failure = reason; }
+    try { await loadStatus(); } catch (reason) { failure ??= reason; }
+    setError(failure === undefined ? undefined : String(failure));
+    return failure === undefined;
+  });
 
   if (!snapshot) {
     return (
@@ -198,6 +220,12 @@ export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
     void runtimeAtlasCommands.recordWorktreeSelection(path).catch((reason) => setError(String(reason)));
   };
 
+  const resizeSidebar = (width: number) => {
+    const boundedWidth = Math.max(200, Math.min(360, width));
+    if (sidebar.current) sidebar.current.style.width = `${boundedWidth}px`;
+    setSidebarWidth(boundedWidth);
+  };
+
   return (
     <section className="atlas" aria-label="Runtime Atlas">
       <div className="atlas-layout">
@@ -206,9 +234,6 @@ export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
             <div><strong>{text("저장소", "Repositories")}</strong><span>{snapshot.repositories.length}</span></div>
             <div className="atlas-sidebar-actions">
               <IconButton label={text("저장소 추가", "Add repository")} disabled={busy} onClick={() => void chooseRepository()}><FolderPlus /></IconButton>
-              <IconButton label={busy ? text("새로고침 중", "Refreshing") : text("새로고침", "Refresh")} disabled={busy} onClick={() => void refresh()}><ArrowClockwise className={busy ? "spinning" : undefined} /></IconButton>
-              {update && <IconButton label={update.availableVersion ? text(`업데이트 ${update.availableVersion} 사용 가능`, `Update ${update.availableVersion} available`) : text("업데이트 확인", "Check for updates")} disabled={update.busy} onClick={update.onOpen}><DownloadSimple weight={update.availableVersion ? "fill" : "bold"} /></IconButton>}
-              <IconButton label={text("설정", "Settings")} onClick={() => setShowingSettings(true)}><Gear /></IconButton>
             </div>
           </div>
           <div className="atlas-repository-list">
@@ -248,14 +273,23 @@ export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
           aria-valuemax={360}
           aria-valuenow={sidebarWidth}
           tabIndex={0}
+          onPointerDown={(event) => {
+            sidebarDrag.current = { x: event.clientX, width: sidebarWidth };
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          onPointerMove={(event) => {
+            if (!event.currentTarget.hasPointerCapture(event.pointerId) || !sidebarDrag.current) return;
+            resizeSidebar(sidebarDrag.current.width + event.clientX - sidebarDrag.current.x);
+          }}
+          onPointerUp={(event) => {
+            sidebarDrag.current = undefined;
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }}
+          onLostPointerCapture={() => { sidebarDrag.current = undefined; }}
           onKeyDown={(event) => {
             if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
             event.preventDefault();
-            const width = Math.max(200, Math.min(360, sidebarWidth + (event.key === "ArrowLeft" ? -10 : 10)));
-            if (sidebar.current) {
-              sidebar.current.style.width = `${width}px`;
-              setSidebarWidth(width);
-            }
+            resizeSidebar(sidebarWidth + (event.key === "ArrowLeft" ? -10 : 10));
           }}
         />
 
@@ -333,6 +367,7 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
 }) {
   const text = (ko: string, en: string) => korean ? ko : en;
   const sessionActions = snapshot.actions.filter((action) => action.repositoryID === repository.id && action.kind === "session");
+  const [draggedPath, setDraggedPath] = useState<string>();
   const move = (index: number, offset: number) => {
     const worktrees = [...repository.worktrees];
     [worktrees[index], worktrees[index + offset]] = [worktrees[index + offset], worktrees[index]];
@@ -368,7 +403,35 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
         });
         const running = managedRun || (sessionActions.some((action) => action.detectsRunningWorktreeListener) && linkedProcesses.length > 0);
         const ports = [...new Set(linkedProcesses.flatMap((process) => process.ports.map((port) => port.port)))];
-        return <div className="atlas-worktree-row" key={worktree.path}>
+        return <div
+          className={`atlas-worktree-row${selectedPath === worktree.path ? " selected" : ""}${draggedPath === worktree.path ? " dragging" : ""}`}
+          draggable={!busy}
+          key={worktree.path}
+          onDragEnd={() => setDraggedPath(undefined)}
+          onDragOver={(event) => {
+            if (!draggedPath || draggedPath === worktree.path) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "move";
+          }}
+          onDragStart={(event) => {
+            if (busy) return event.preventDefault();
+            setDraggedPath(worktree.path);
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData("text/plain", worktree.path);
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            if (!draggedPath || draggedPath === worktree.path) return;
+            const worktrees = [...repository.worktrees];
+            const source = worktrees.findIndex((item) => item.path === draggedPath);
+            const target = worktrees.findIndex((item) => item.path === worktree.path);
+            if (source < 0 || target < 0) return;
+            const [moved] = worktrees.splice(source, 1);
+            worktrees.splice(target, 0, moved);
+            setDraggedPath(undefined);
+            reorder(worktrees.map((item) => item.path));
+          }}
+        >
           <button
             type="button"
             className="atlas-worktree-button"
@@ -400,10 +463,11 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
   error?: string;
   clearError: () => void;
   notices: RuntimeAtlasSnapshot["notices"];
-  refresh: () => Promise<void>;
+  refresh: () => Promise<boolean>;
   mutate: (operation: () => Promise<unknown>) => Promise<boolean>;
 }) {
   const text = (ko: string, en: string) => korean ? ko : en;
+  const [message, setMessage] = useState<string>();
   const relations = snapshot.relations.filter(
     (relation): relation is Exclude<ProcessRelation, { kind: "unlinked" }> =>
       relation.kind !== "unlinked" && relation.worktreePath === worktree.path,
@@ -417,7 +481,7 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
   const actions = snapshot.actions.filter((action) => action.repositoryID === repository.id);
 
   return (
-    <>
+    <div className="atlas-worktree-stack">
       <header className="atlas-worktree-header">
         <div className="atlas-worktree-identity">
           <span className="atlas-connection-icon"><ShareNetwork weight="bold" /></span>
@@ -434,14 +498,15 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
       </header>
 
       {error && <div className="atlas-notice error atlas-operation-error" role="alert"><XCircle weight="fill" /><div><strong>{text("요청을 완료하지 못했습니다.", "The request could not be completed.")}</strong><span>{error}</span></div><button type="button" onClick={clearError}>{text("닫기", "Dismiss")}</button></div>}
+      {message && <Notice kind="info" title="Runtime Atlas" message={message} />}
       {notices.map((notice, index) => <Notice key={`${notice.kind}-${index}`} kind={notice.kind} title={notice.kind === "error" ? text("로컬 데이터 문제", "Local data issue") : text("알림", "Notice")} message={notice.message} />)}
       {worktree.availability === "unavailable" && (
         <Notice kind="error" title={text("워크트리를 확인할 수 없습니다.", "Worktree unavailable")} message={worktree.unavailableReason || text("Git이 이 워크트리를 검사하지 못했습니다.", "Git could not inspect this worktree.")} />
       )}
-      {actions.length > 0 && <section className="atlas-command-grid" aria-label={text("명령어", "Commands")}>{actions.map((action) => <ActionRow key={`${action.id}:${worktree.path}:${JSON.stringify(action.inputs)}`} action={action} run={snapshot.actionRuns.find((item) => item.actionID === action.id && item.worktreePath === worktree.path)} worktree={worktree} allWorktrees={repository.worktrees} korean={korean} busy={busy} mutate={mutate} />)}</section>}
+      {actions.length > 0 && <section className="atlas-command-grid" aria-label={text("명령어", "Commands")}>{actions.map((action) => <ActionRow key={`${action.id}:${worktree.path}:${JSON.stringify(action.inputs)}`} action={action} run={snapshot.actionRuns.find((item) => item.actionID === action.id && item.worktreePath === worktree.path)} worktree={worktree} allWorktrees={repository.worktrees} korean={korean} busy={busy} mutate={mutate} message={setMessage} />)}</section>}
 
       <section className="atlas-card" aria-labelledby="atlas-runtime-title">
-        <header><div><h4 id="atlas-runtime-title">{text("실행 상태", "Runtime status")}</h4><p>{text("검증된 워크트리·프로세스·포트·컨테이너 관계입니다.", "Verified worktree, process, port, and container relationships.")}</p></div></header>
+        <header><div><h4 id="atlas-runtime-title">{text("실행 상태", "Runtime Status")}</h4><p>{text("이 작업 폴더와 연결된 프로세스, 컨테이너와 열린 포트를 보여줍니다.", "Processes, containers, and open ports linked to this working folder.")}</p></div></header>
         <div className="atlas-card-body atlas-runtime-list">
           <RuntimeRow icon={<GitBranch />} title={leafName(worktree.path)} detail={`${worktree.detached ? "detached" : worktree.branch || "—"} @ ${worktree.shortSHA || "—"}`} tone="accent" />
           {snapshot.processDiscovery.state === "unavailable" && <RuntimeRow icon={<Warning weight="fill" />} title={text("프로세스 사용 불가", "Processes unavailable")} detail={snapshot.processDiscovery.reason || text("열린 포트(LISTEN)를 읽지 못했습니다.", "Open ports could not be read (LISTEN).") } tone="warning" />}
@@ -467,7 +532,7 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
           ))}
         </div>
       </section>
-    </>
+    </div>
   );
 }
 
@@ -498,7 +563,7 @@ function ProcessRow({ process, relation, worktree, korean, busy, mutate }: {
       actions={<>
         {relation.kind === "userLinked" && <button type="button" disabled={busy} onClick={() => void mutate(() => runtimeAtlasCommands.unlinkProcess(process.identity))}>{text("연결 해제", "Unlink")}</button>}
         {process.cwd
-          ? <button type="button" className="danger-text" disabled={busy} onClick={stop}>{text("프로세스 중지", "Stop process")}</button>
+          ? <button type="button" className="danger-text" disabled={busy} onClick={stop}>{text("포트 닫기", "Close ports")}</button>
           : <span title={text("검증된 cwd가 없어 안전하게 중지할 수 없습니다.", "A verified cwd is required for safe termination.")}>{text("중지 불가", "Stop unavailable")}</span>}
       </>}
     />
@@ -523,7 +588,7 @@ function RuntimeRow({ icon, title, detail, badges = [], tone = "muted", actions 
   );
 }
 
-function ActionRow({ action, run, worktree, allWorktrees, korean, busy, mutate }: {
+function ActionRow({ action, run, worktree, allWorktrees, korean, busy, mutate, message }: {
   action: CustomAction;
   run?: ActionRun;
   worktree: Worktree;
@@ -531,6 +596,7 @@ function ActionRow({ action, run, worktree, allWorktrees, korean, busy, mutate }
   korean: boolean;
   busy: boolean;
   mutate: (operation: () => Promise<unknown>) => Promise<boolean>;
+  message: (value?: string) => void;
 }) {
   const text = (ko: string, en: string) => korean ? ko : en;
   const [values, setValues] = useState<Record<string, string | boolean>>(() =>
@@ -560,17 +626,17 @@ function ActionRow({ action, run, worktree, allWorktrees, korean, busy, mutate }
     if (action.inputs.length === 0) void execute(nextRestart);
   };
   const active = run?.managed && ["pending", "running", "restarting", "stopping"].includes(run.phase);
-  const status = run ? (run.managed ? run.phase : text("외부 · 실행 중", "External · Running")) : undefined;
+  const externalRunning = Boolean(run && !run.managed);
+  const status = run ? (run.managed ? run.phase : text("외부 실행 중", "External · Running")) : undefined;
   return (
     <article className="atlas-action-row">
-      <button type="button" className="atlas-command-button" disabled={busy || planning || worktree.availability !== "available" || (!run?.managed && Boolean(run))} onClick={() => active ? void mutate(() => runtimeAtlasCommands.stopAction(action.id, worktree.path)) : openExecution(false)}>
-        {active ? <Stop weight="fill" /> : action.kind === "session" ? <Play weight="fill" /> : <Terminal weight="fill" />}
+      <button type="button" className={`atlas-command-button${externalRunning ? " external-running" : ""}`} disabled={busy || planning || worktree.availability !== "available"} onClick={() => externalRunning ? message(text("이 작업 폴더에서 이미 포트를 연 프로세스가 있습니다. 새로 실행하려면 실행 상태에서 해당 포트를 먼저 닫으세요.", "A listener is already running from this working folder. Close it in Runtime Status before starting another one.")) : active ? void mutate(() => runtimeAtlasCommands.stopAction(action.id, worktree.path)) : openExecution(false)}>
+        {externalRunning ? <Broadcast weight="bold" /> : active ? <Stop weight="fill" /> : action.kind === "session" ? <Play weight="fill" /> : <Terminal weight="fill" />}
         <strong>{action.name}</strong>
         {status && run && <span className={run.phase}>{status}{run.exitCode !== null ? ` (${run.exitCode})` : ""}</span>}
       </button>
       {action.kind === "session" && action.restartCommandTemplate && run?.managed && run.phase === "running" && <IconButton label={text(`${action.name} 재시작`, `Restart ${action.name}`)} disabled={busy || planning} onClick={() => openExecution(true)}><ArrowClockwise /></IconButton>}
       {run?.output && <IconButton label={text(`${action.name} 출력`, `${action.name} output`)} onClick={() => setShowingOutput(true)}><FileText /></IconButton>}
-      {planError && <p className="atlas-action-error" role="alert">{planError}</p>}
       {preparing && <ActionConfirmationDialog action={action} review={review} restart={restart} values={values} setValues={setValues} allWorktrees={allWorktrees} korean={korean} busy={busy || planning} planError={planError} close={() => setPreparing(false)} prepare={() => void execute(restart)} confirm={() => review && void mutate(() => runtimeAtlasCommands.confirmAction(review.plan.confirmationToken)).then((confirmed) => { if (confirmed) setPreparing(false); })} />}
       {showingOutput && run?.output && <ActionOutputDialog action={action} run={run} korean={korean} close={() => setShowingOutput(false)} />}
     </article>
@@ -630,14 +696,14 @@ function UnlinkedProcesses({ snapshot, korean, busy, mutate }: {
   });
   if (unlinked.length === 0) return null;
   return (
-    <section className="atlas-unlinked atlas-card" aria-labelledby="atlas-unlinked-title">
-      <header><div><h3 id="atlas-unlinked-title">{text("연결되지 않은 프로세스", "Unlinked processes")}</h3><p>{text("확인할 수 없는 cwd를 숨기거나 워크트리로 추측하지 않습니다. 연결하려면 워크트리를 직접 선택하세요.", "Unavailable cwd evidence is not hidden or guessed. Select a worktree explicitly to link a process.")}</p></div></header>
+    <details className="atlas-unlinked atlas-card" aria-labelledby="atlas-unlinked-title">
+      <summary><CaretRight aria-hidden="true" /><div><h3 id="atlas-unlinked-title">{text("연결되지 않은 프로세스", "Unlinked processes")}</h3><p>{text("확인할 수 없는 cwd를 숨기거나 워크트리로 추측하지 않습니다. 연결하려면 워크트리를 직접 선택하세요.", "Unavailable cwd evidence is not hidden or guessed. Select a worktree explicitly to link a process.")}</p></div><span>{unlinked.length}</span></summary>
       <div className="atlas-card-body">
         {unlinked.map(({ process, relation }) => (
           <LinkProcessRow key={`${process.identity.pid}-${process.identity.startIdentity}`} process={process} relation={relation} repositories={snapshot.repositories} korean={korean} busy={busy} mutate={mutate} />
         ))}
       </div>
-    </section>
+    </details>
   );
 }
 
@@ -760,8 +826,8 @@ function IconButton({ label, disabled, onClick, children }: { label: string; dis
   return <button type="button" className="atlas-icon-button" aria-label={label} title={label} disabled={disabled} onClick={onClick}>{children}</button>;
 }
 
-function Notice({ kind, title, message }: { kind: "warning" | "error"; title: string; message: string }) {
-  return <div className={`atlas-notice ${kind}`} role={kind === "error" ? "alert" : "status"}>{kind === "error" ? <XCircle weight="fill" /> : <Warning weight="fill" />}<div><strong>{title}</strong><span>{message}</span></div></div>;
+function Notice({ kind, title, message }: { kind: "info" | "warning" | "error"; title: string; message: string }) {
+  return <div className={`atlas-notice ${kind}`} role={kind === "error" ? "alert" : "status"}>{kind === "error" ? <XCircle weight="fill" /> : kind === "info" ? <Info weight="fill" /> : <Warning weight="fill" />}<div><strong>{title}</strong><span>{message}</span></div></div>;
 }
 
 function findWorktree(repositories: Repository[], path?: string) {

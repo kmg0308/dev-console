@@ -1639,14 +1639,14 @@ impl RuntimeAtlasState {
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_status(
     state: State<'_, RuntimeAtlasState>,
 ) -> Result<RuntimeAtlasSnapshot, String> {
     state.status()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_add_repository(
     state: State<'_, RuntimeAtlasState>,
     path: String,
@@ -1654,7 +1654,7 @@ pub fn runtime_atlas_add_repository(
     state.add_repository(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_remove_repository(
     state: State<'_, RuntimeAtlasState>,
     repository_id: String,
@@ -1662,7 +1662,7 @@ pub fn runtime_atlas_remove_repository(
     state.remove_repository(Uuid::parse_str(&repository_id).map_err(string_error)?)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_set_language(
     state: State<'_, RuntimeAtlasState>,
     language: AppLanguage,
@@ -1670,7 +1670,7 @@ pub fn runtime_atlas_set_language(
     state.store.set_app_language(language).map_err(string_error)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_save_action(
     state: State<'_, RuntimeAtlasState>,
     action: CustomActionDefinition,
@@ -1678,7 +1678,7 @@ pub fn runtime_atlas_save_action(
     state.save_action(action)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_delete_action(
     state: State<'_, RuntimeAtlasState>,
     action_id: String,
@@ -1686,7 +1686,7 @@ pub fn runtime_atlas_delete_action(
     state.delete_action(Uuid::parse_str(&action_id).map_err(string_error)?)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_plan_action(
     state: State<'_, RuntimeAtlasState>,
     action_id: String,
@@ -1702,7 +1702,7 @@ pub fn runtime_atlas_plan_action(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_confirm_action(
     state: State<'_, RuntimeAtlasState>,
     confirmation_token: String,
@@ -1710,7 +1710,7 @@ pub fn runtime_atlas_confirm_action(
     state.confirm_action(Uuid::parse_str(&confirmation_token).map_err(string_error)?)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_set_worktree_order(
     state: State<'_, RuntimeAtlasState>,
     repository_id: String,
@@ -1722,7 +1722,7 @@ pub fn runtime_atlas_set_worktree_order(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_stop_action(
     state: State<'_, RuntimeAtlasState>,
     action_id: String,
@@ -1734,7 +1734,7 @@ pub fn runtime_atlas_stop_action(
     )
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_stop_process(
     state: State<'_, RuntimeAtlasState>,
     process_identity: ProcessIdentity,
@@ -1743,7 +1743,7 @@ pub fn runtime_atlas_stop_process(
     state.stop_process(&process_identity, &worktree_path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_link_process(
     state: State<'_, RuntimeAtlasState>,
     process_identity: ProcessIdentity,
@@ -1752,7 +1752,7 @@ pub fn runtime_atlas_link_process(
     state.link_process(process_identity, &worktree_path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_unlink_process(
     state: State<'_, RuntimeAtlasState>,
     process_identity: ProcessIdentity,
@@ -1760,7 +1760,7 @@ pub fn runtime_atlas_unlink_process(
     state.unlink_process(&process_identity)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_advance_worktree_navigation(
     state: State<'_, RuntimeAtlasState>,
     current_path: Option<String>,
@@ -1769,21 +1769,21 @@ pub fn runtime_atlas_advance_worktree_navigation(
     state.advance_navigation(current_path.as_deref(), forward)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_commit_worktree_navigation(
     state: State<'_, RuntimeAtlasState>,
 ) -> Result<(), String> {
     state.commit_navigation()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_cancel_worktree_navigation(
     state: State<'_, RuntimeAtlasState>,
 ) -> Result<(), String> {
     state.cancel_navigation()
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_record_worktree_selection(
     state: State<'_, RuntimeAtlasState>,
     path: String,
@@ -1791,7 +1791,7 @@ pub fn runtime_atlas_record_worktree_selection(
     state.record_selection(&path)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn runtime_atlas_open_worktree_in_vscode(
     state: State<'_, RuntimeAtlasState>,
     path: String,
