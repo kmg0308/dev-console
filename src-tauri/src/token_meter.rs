@@ -23,7 +23,7 @@ use token_meter_core::{
         DashboardAccountState, DashboardRequest, DashboardSettings, DashboardSnapshotDto,
         compose_dashboard, dashboard_event_window_start,
     },
-    models::{ScanResult, TokenDeviceMetadata},
+    models::{ScanResult, SyncFolderStatus, TokenDeviceMetadata},
     scanner::{ScannerRoots, TokenLogScanner},
     settings::TokenMeterSettings,
     sync_store::{TokenSyncStore, merge_local_and_sync},
@@ -204,7 +204,7 @@ pub fn token_meter_set_sync_folder(
             return Err("Source configuration is disabled in updater QA.".to_owned());
         }
         state.with_settings(|settings| {
-            let path = checked_path(path, PathKind::Directory)?;
+            let path = checked_sync_folder_path(path)?;
             if let Some(path) = path.as_deref() {
                 state.prepare_icloud_sync_folder_if_default(Path::new(path))?;
             }
@@ -491,7 +491,12 @@ impl TokenMeterState {
             settings.local_device_id.clone(),
             self.local_device_name.clone(),
         );
-        let sync = if self.source_isolation_root.is_none()
+        let invalid_sync = settings
+            .sync_folder_path
+            .as_deref()
+            .and_then(invalid_sync_folder_status);
+        let sync = if invalid_sync.is_none()
+            && self.source_isolation_root.is_none()
             && let Some(folder) = settings.sync_folder_path.as_deref()
         {
             TokenSyncStore::new(folder, local_device.clone())
@@ -503,7 +508,9 @@ impl TokenMeterState {
         let scanner =
             TokenLogScanner::new(self.scanner_roots(settings), local_device, Some(&cache));
         let mut scan = scanner.cached_result(event_after).unwrap_or_default();
-        if let Some(sync) = sync {
+        if let Some(status) = invalid_sync {
+            scan.sync_status = status;
+        } else if let Some(sync) = sync {
             scan.events = merge_local_and_sync(scan.events, sync.events);
             scan.sync_status = sync.status;
             scan.sync_devices = devices(&scan.events);
@@ -533,10 +540,15 @@ impl TokenMeterState {
         if rebuild_cache {
             scanner.clear_cache().map_err(string_error)?;
         }
-        let sync_store = (synchronize_sync && self.source_isolation_root.is_none())
-            .then_some(settings.sync_folder_path.as_deref())
-            .flatten()
-            .map(|folder| TokenSyncStore::new(folder, local_device.clone()).with_cache(&cache));
+        let invalid_sync = settings
+            .sync_folder_path
+            .as_deref()
+            .and_then(invalid_sync_folder_status);
+        let sync_store =
+            (invalid_sync.is_none() && synchronize_sync && self.source_isolation_root.is_none())
+                .then_some(settings.sync_folder_path.as_deref())
+                .flatten()
+                .map(|folder| TokenSyncStore::new(folder, local_device.clone()).with_cache(&cache));
         let force_full_export = if !rebuild_cache && modified_after.is_some() {
             sync_store.as_ref().is_some_and(|store| {
                 store
@@ -558,7 +570,9 @@ impl TokenMeterState {
         if is_cancelled() {
             return Err(DASHBOARD_REFRESH_CANCELLED.to_owned());
         }
-        if let Some(sync_store) = sync_store {
+        if let Some(status) = invalid_sync {
+            scan.sync_status = status;
+        } else if let Some(sync_store) = sync_store {
             let scan_complete = scan.parse_error_count == 0;
             let outcome = sync_store.synchronize(
                 if scan_complete { &scan.events } else { &[] },
@@ -867,6 +881,32 @@ fn checked_path(value: Option<String>, kind: PathKind) -> Result<Option<String>,
         .to_owned());
     }
     Ok(Some(value))
+}
+
+fn checked_sync_folder_path(value: Option<String>) -> Result<Option<String>, String> {
+    let value = checked_path(value, PathKind::Directory)?;
+    if let Some(path) = value.as_deref()
+        && let Some(error) = invalid_sync_folder_error(Path::new(path))
+    {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+fn invalid_sync_folder_status(path: &str) -> Option<SyncFolderStatus> {
+    Some(SyncFolderStatus {
+        path: Some(path.to_owned()),
+        exists: Path::new(path).is_dir(),
+        export_error: Some(invalid_sync_folder_error(Path::new(path))?),
+        ..SyncFolderStatus::default()
+    })
+}
+
+fn invalid_sync_folder_error(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.eq_ignore_ascii_case("devices"))
+        .then(|| "Choose the TokenMeter sync root, not its internal devices folder.".to_owned())
 }
 
 fn checked_executable_path(value: Option<String>) -> Result<Option<String>, String> {
@@ -1668,6 +1708,53 @@ mod tests {
             checked_path(Some(String::new()), PathKind::File).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn sync_folder_rejects_internal_devices_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("TokenMeter");
+        let devices = root.join("devices");
+        let nested_devices = devices.join("DEVICES");
+        fs::create_dir_all(&nested_devices).unwrap();
+
+        let valid = root.to_string_lossy().into_owned();
+        assert_eq!(
+            checked_sync_folder_path(Some(valid.clone())).unwrap(),
+            Some(valid)
+        );
+        for invalid in [devices, nested_devices] {
+            assert!(
+                checked_sync_folder_path(Some(invalid.to_string_lossy().into_owned()))
+                    .unwrap_err()
+                    .contains("sync root")
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_devices_setting_does_not_create_another_nested_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let invalid = directory.path().join("TokenMeter Sync/devices");
+        fs::create_dir_all(&invalid).unwrap();
+        write_codex_session(
+            &state.home_dir.join(".codex/sessions/local.jsonl"),
+            "2026-01-01T00:00:00.000Z",
+            10,
+        );
+        let mut settings = state.load_settings().unwrap();
+        settings.sync_folder_path = Some(invalid.to_string_lossy().into_owned());
+
+        let cached = state.cached_scan(&settings, None).unwrap();
+        assert!(cached.sync_status.export_error.is_some());
+        let scan = state
+            .scan(&settings, false, None, None, true, || false)
+            .unwrap();
+
+        assert_eq!(scan.events.len(), 1);
+        assert!(scan.sync_status.export_error.is_some());
+        assert!(!invalid.join("devices").exists());
     }
 
     #[test]
