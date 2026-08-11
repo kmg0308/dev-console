@@ -1,4 +1,4 @@
-name: Desktop checks and unsigned bundles
+name: Desktop checks and releases
 
 on:
   pull_request:
@@ -51,19 +51,16 @@ jobs:
             product: TokenMeter
             binary: TokenMeter
             identifier: local.tokenmeter.app
-            version: 0.2.3
             runtime: false
           - id: runtime-atlas
             product: RuntimeAtlas
             binary: RuntimeAtlas
             identifier: com.kmg0308.runtimeatlas
-            version: 0.2.3
             runtime: true
           - id: dev-console
             product: DevConsole
             binary: DevConsole
             identifier: com.kmg0308.devconsole
-            version: 0.2.3
             runtime: true
         platform: [macos, windows]
         include:
@@ -82,6 +79,8 @@ jobs:
             bundles: nsis
             bundle_dir: nsis
             bundle_suffix: x64-setup.exe
+    env:
+      BUILD_VERSION: ${{ github.event_name == 'push' && format('0.3.{0}', github.run_number) || '0.3.0' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -95,17 +94,39 @@ jobs:
         if: runner.os == 'Windows'
         run: rustup target add x86_64-pc-windows-msvc
       - run: npm ci
-      - name: Build unsigned bundle
+      - name: Prepare release build
+        if: github.event_name == 'push'
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: >-
+          node scripts/build-release.mjs
+          --ci-overlay
+          '${{ matrix.app.id }}'
+          '${{ matrix.target }}'
+          '${{ env.BUILD_VERSION }}'
+          '${{ matrix.app.id == 'dev-console' && 'updater' || 'bundle' }}'
+          '${{ runner.temp }}/tauri.ci.conf.json'
+      - name: Build pull request bundle
+        if: github.event_name == 'pull_request'
         run: npm run tauri -- build --ci --no-sign --config apps/${{ matrix.app.id }}/tauri.conf.json --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Build unsigned release bundle
+        if: github.event_name == 'push' && matrix.app.id != 'dev-console'
+        run: npm run tauri -- build --ci --no-sign --config apps/${{ matrix.app.id }}/tauri.conf.json --config '${{ runner.temp }}/tauri.ci.conf.json' --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+      - name: Build updater-signed DevConsole release
+        if: github.event_name == 'push' && matrix.app.id == 'dev-console'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: npm run tauri -- build --ci --config apps/dev-console/tauri.conf.json --config '${{ runner.temp }}/tauri.ci.conf.json' --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
       - name: Verify macOS DMG install and startup
         if: matrix.platform == 'macos'
         run: >-
           bash scripts/verify-macos-bundle.sh
-          target/${{ matrix.target }}/release/bundle/dmg/${{ matrix.app.product }}_${{ matrix.app.version }}_universal.dmg
+          target/${{ matrix.target }}/release/bundle/dmg/${{ matrix.app.product }}_${{ env.BUILD_VERSION }}_universal.dmg
           '${{ matrix.app.product }}'
           '${{ matrix.app.binary }}'
           '${{ matrix.app.identifier }}'
-          '${{ matrix.app.version }}'
+          '${{ env.BUILD_VERSION }}'
           '${{ matrix.app.runtime }}'
       - name: Test RuntimeAtlas macOS package contract
         if: matrix.app.id == 'runtime-atlas' && matrix.platform == 'macos'
@@ -118,15 +139,60 @@ jobs:
           -ProductName '${{ matrix.app.product }}'
           -MainBinaryName '${{ matrix.app.binary }}'
           -BundleIdentifier '${{ matrix.app.identifier }}'
-          -Version '${{ matrix.app.version }}'
+          -Version '${{ env.BUILD_VERSION }}'
           -RuntimeFeature '${{ matrix.app.runtime }}'
           -AllowWindowsServerSmoke
-      - name: Preserve verified unsigned bundle
+      - name: Create macOS updater manifest
+        if: github.event_name == 'push' && matrix.app.id == 'dev-console' && matrix.platform == 'macos'
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: >-
+          node scripts/build-release.mjs
+          --ci-manifest
+          dev-console
+          '${{ matrix.target }}'
+          '${{ env.BUILD_VERSION }}'
+          'https://github.com/${{ github.repository }}/releases/download/v${{ env.BUILD_VERSION }}/DevConsole.app.tar.gz'
+      - name: Create Windows updater manifest
+        if: github.event_name == 'push' && matrix.app.id == 'dev-console' && matrix.platform == 'windows'
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: >-
+          node scripts/build-release.mjs
+          --ci-manifest
+          dev-console
+          '${{ matrix.target }}'
+          '${{ env.BUILD_VERSION }}'
+          'https://github.com/${{ github.repository }}/releases/download/v${{ env.BUILD_VERSION }}/DevConsole_${{ env.BUILD_VERSION }}_x64-setup.exe'
+      - name: Preserve verified unsigned package
         if: github.event_name == 'push'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: unsigned-${{ matrix.app.id }}-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/bundle/${{ matrix.bundle_dir }}/${{ matrix.app.product }}_${{ matrix.app.version }}_${{ matrix.bundle_suffix }}
+          path: target/${{ matrix.target }}/release/bundle/${{ matrix.bundle_dir }}/${{ matrix.app.product }}_${{ env.BUILD_VERSION }}_${{ matrix.bundle_suffix }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Preserve macOS updater
+        if: github.event_name == 'push' && matrix.app.id == 'dev-console' && matrix.platform == 'macos'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: updater-dev-console-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/macos/DevConsole.app.tar.gz
+            target/${{ matrix.target }}/release/bundle/macos/DevConsole.app.tar.gz.sig
+            target/${{ matrix.target }}/release/bundle/macos/dev-console-universal-apple-darwin.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Preserve Windows updater
+        if: github.event_name == 'push' && matrix.app.id == 'dev-console' && matrix.platform == 'windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: updater-dev-console-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/bundle/nsis/DevConsole_${{ env.BUILD_VERSION }}_x64-setup.exe.sig
+            target/${{ matrix.target }}/release/bundle/nsis/dev-console-x86_64-pc-windows-msvc.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -139,3 +205,46 @@ jobs:
       - run: |
           test "${{ needs.checks.result }}" = success
           test "${{ needs.bundles.result }}" = success
+
+  publish:
+    if: github.event_name == 'push'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      BUILD_VERSION: 0.3.${{ github.run_number }}
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: unsigned-*
+          path: release-assets
+          merge-multiple: true
+      - name: Download updater files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: updater-*
+          path: release-assets
+          merge-multiple: true
+      - name: Prepare stable download names
+        run: |
+          set -euo pipefail
+          for product in TokenMeter RuntimeAtlas DevConsole; do
+            cp "release-assets/${product}_${BUILD_VERSION}_universal.dmg" "release-assets/${product}_universal.dmg"
+            cp "release-assets/${product}_${BUILD_VERSION}_x64-setup.exe" "release-assets/${product}_x64-setup.exe"
+          done
+          mv release-assets/dev-console-universal-apple-darwin.json release-assets/dev-console-darwin.json
+          mv release-assets/dev-console-x86_64-pc-windows-msvc.json release-assets/dev-console-windows.json
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "v${BUILD_VERSION}"
+          release-assets/*
+          --repo "$GITHUB_REPOSITORY"
+          --target "$GITHUB_SHA"
+          --title "DevConsole ${BUILD_VERSION}"
+          --notes "자동 업데이트 파일은 updater 키로 서명했습니다. macOS와 Windows 설치 파일은 기존 배포와 같이 OS 코드 서명이 없습니다."
+          --generate-notes
+          --latest

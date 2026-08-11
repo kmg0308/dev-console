@@ -119,6 +119,55 @@ pub(crate) fn verified_ledger_snapshot(
     verified_ledger_snapshot_with(path, || Ok(()))
 }
 
+pub(crate) fn dataless_ledger_snapshot(
+    path: &Path,
+) -> Result<Option<(PathBuf, u64, SystemTime, String)>, SyncError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt as MacMetadataExt;
+        use std::os::unix::fs::MetadataExt as UnixMetadataExt;
+
+        let first = fs::symlink_metadata(path)?;
+        if !first.is_file() || !macos_dataless_flags(first.st_flags()) {
+            return Ok(None);
+        }
+        let first_identity = FileIdentity(first.dev(), first.ino());
+        let boundary = LedgerBoundary::open_existing(path)?;
+        boundary.validate(path)?;
+        let current = fs::symlink_metadata(path)?;
+        if !current.is_file()
+            || !macos_dataless_flags(current.st_flags())
+            || FileIdentity(current.dev(), current.ino()) != first_identity
+        {
+            return Err(identity_changed(
+                "dataless sync ledger changed while its metadata was read",
+            )
+            .into());
+        }
+        boundary.validate(path)?;
+        let name = path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "sync ledger name is missing")
+        })?;
+        Ok(Some((
+            boundary.canonical_devices.join(name),
+            current.len(),
+            current.modified()?,
+            first_identity.cache_token(),
+        )))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_dataless_flags(flags: u32) -> bool {
+    const SF_DATALESS: u32 = 0x4000_0000;
+    flags & SF_DATALESS != 0
+}
+
 pub(crate) fn verified_direct_ledger_paths(devices: &Path) -> io::Result<Vec<PathBuf>> {
     verified_direct_ledger_paths_with(devices, || Ok(()))
 }
@@ -1355,6 +1404,13 @@ mod tests {
     use chrono::TimeZone;
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::Duration;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recognizes_macos_dataless_flag() {
+        assert!(macos_dataless_flags(0x4000_0000));
+        assert!(!macos_dataless_flags(0));
+    }
 
     fn record(device: &str, event: &str, input: i64) -> SyncLedgerRecord {
         SyncLedgerRecord::v2(

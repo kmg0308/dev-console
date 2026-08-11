@@ -38,6 +38,8 @@ const flavors = {
   },
 };
 const targets = new Set(["universal-apple-darwin", "x86_64-pc-windows-msvc"]);
+const automatedUpdaterEndpoint =
+  "https://github.com/kmg0308/dev-console/releases/latest/download/dev-console-{{target}}.json";
 const releaseCredentialNames = new Set([
   "TAURI_SIGNING_PRIVATE_KEY",
   "TAURI_SIGNING_PRIVATE_KEY_PATH",
@@ -157,6 +159,37 @@ function overlay(target, env) {
   };
 }
 
+function numericVersion(value, role = "Version") {
+  if (typeof value !== "string" || !/^\d+\.\d+\.\d+$/.test(value)) {
+    throw new Error(`${role} must be a numeric semantic version`);
+  }
+  return value;
+}
+
+function ciOverlay(flavor, target, version, mode, env) {
+  if (!flavors[flavor]) throw new Error(`Invalid flavor: ${flavor}`);
+  if (!targets.has(target)) throw new Error(`Invalid target: ${target}`);
+  if (!new Set(["bundle", "updater"]).has(mode)) throw new Error(`Invalid CI release mode: ${mode}`);
+  if (mode === "updater" && flavor !== "dev-console") {
+    throw new Error("Automated updater releases are limited to DevConsole");
+  }
+
+  const config = { version: numericVersion(version, "CI release version") };
+  if (mode === "updater") {
+    config.bundle = { createUpdaterArtifacts: true };
+    if (target === "universal-apple-darwin") {
+      config.bundle.macOS = { signingIdentity: "-" };
+    }
+    config.plugins = {
+      updater: {
+        pubkey: required(env, "TAURI_UPDATER_PUBLIC_KEY"),
+        endpoints: [automatedUpdaterEndpoint],
+      },
+    };
+  }
+  return config;
+}
+
 function command(flavor, target, overlayPath) {
   return {
     executable: process.execPath,
@@ -175,6 +208,7 @@ function command(flavor, target, overlayPath) {
 function releasePlan(flavor, target, version, outputRoot = targetRoot) {
   const app = flavors[flavor];
   if (!app || !targets.has(target)) throw new Error("Invalid release plan");
+  numericVersion(version, "Release version");
   const bundle = join(outputRoot, target, "release", "bundle");
   if (target === "universal-apple-darwin") {
     const directory = join(bundle, "macos");
@@ -719,10 +753,11 @@ function writeManifest(plan, env) {
 
 function workspaceVersion() {
   const version = JSON.parse(readFileSync(join(root, "src-tauri", "tauri.conf.json"), "utf8")).version;
-  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
+  try {
+    return numericVersion(version, "src-tauri/tauri.conf.json version");
+  } catch {
     throw new Error("src-tauri/tauri.conf.json must contain a numeric semantic version");
   }
-  return version;
 }
 
 function signatureSelfTest() {
@@ -1007,14 +1042,63 @@ function selfTest() {
   for (const name of releaseCredentialNames) assert.equal(buildSteps[0].env[name], undefined);
   assert.equal(buildSteps[1].env.TAURI_SIGNING_PRIVATE_KEY, common.TAURI_SIGNING_PRIVATE_KEY);
   assert.deepEqual(releaseBuildSteps(macPlan, "/private/release/overlay.json", mac)[0].args, ["run", "build"]);
+  assert.deepEqual(ciOverlay(
+    "dev-console",
+    "universal-apple-darwin",
+    "0.3.64",
+    "updater",
+    common,
+  ), {
+    version: "0.3.64",
+    bundle: { createUpdaterArtifacts: true, macOS: { signingIdentity: "-" } },
+    plugins: {
+      updater: {
+        pubkey: common.TAURI_UPDATER_PUBLIC_KEY,
+        endpoints: [automatedUpdaterEndpoint],
+      },
+    },
+  });
+  assert.deepEqual(ciOverlay(
+    "token-meter",
+    "x86_64-pc-windows-msvc",
+    "0.3.64",
+    "bundle",
+    {},
+  ), { version: "0.3.64" });
+  assert.throws(
+    () => ciOverlay("token-meter", "universal-apple-darwin", "0.3.64", "updater", common),
+    /limited to DevConsole/,
+  );
+  assert.throws(
+    () => ciOverlay("dev-console", "universal-apple-darwin", "invalid", "updater", common),
+    /numeric semantic version/,
+  );
   process.stdout.write(successOutput);
 }
 
 function main() {
   if (process.argv.length === 3 && process.argv[2] === "--self-test") return selfTest();
   if (process.argv.length === 3 && process.argv[2] === "--self-test-signature") return signatureSelfTest();
+  if (process.argv.length === 8 && process.argv[2] === "--ci-overlay") {
+    const [, , , flavor, target, version, mode, output] = process.argv;
+    mkdirSync(dirname(output), { recursive: true });
+    writeFileSync(output, `${JSON.stringify(ciOverlay(flavor, target, version, mode, process.env))}\n`, {
+      mode: 0o600,
+    });
+    return;
+  }
+  if (process.argv.length === 7 && process.argv[2] === "--ci-manifest") {
+    const [, , , flavor, target, version, artifactUrl] = process.argv;
+    const plan = releasePlan(flavor, target, version);
+    writeManifest(plan, {
+      TAURI_UPDATER_PUBLIC_KEY: required(process.env, "TAURI_UPDATER_PUBLIC_KEY"),
+      TAURI_UPDATER_ARTIFACT_URL: artifactUrl,
+    });
+    process.stdout.write(`${plan.manifest}\n`);
+    return;
+  }
   if (process.argv.length !== 4) {
-    throw new Error("Usage: build-release.mjs <token-meter|runtime-atlas|dev-console> <universal-apple-darwin|x86_64-pc-windows-msvc>");
+    throw new Error("Usage: build-release.mjs <flavor> <target> | --ci-overlay <flavor> <target> <version> <bundle|updater> <output> | --ci-manifest <flavor> <target> <version> <artifact-url>");
   }
 
   const [, , flavor, target] = process.argv;
