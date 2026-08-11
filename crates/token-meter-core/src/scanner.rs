@@ -126,6 +126,13 @@ impl<'a> TokenLogScanner<'a> {
                 if is_cancelled() {
                     return ScanResult::default();
                 }
+                if self.cache.is_some_and(|cache| {
+                    cache
+                        .has_current_local_events(&file.snapshot)
+                        .unwrap_or(false)
+                }) {
+                    continue;
+                }
                 match self.cached_or_parsed_events(file, &is_cancelled) {
                     Ok(events) => fresh_events.extend(events),
                     Err(()) => root.parse_error_count += 1,
@@ -167,14 +174,14 @@ impl<'a> TokenLogScanner<'a> {
             .local_roots()
             .into_iter()
             .map(|root| {
+                let canonical_root = root.path.as_deref().map(canonical_or_owned);
                 let count = origins
                     .iter()
                     .filter(|(path, source)| {
                         *source == root.source
-                            && root
-                                .path
-                                .as_deref()
-                                .is_some_and(|root| path_is_under(path, root))
+                            && canonical_root
+                                .as_ref()
+                                .is_some_and(|root| Path::new(path).starts_with(root))
                     })
                     .count();
                 ScanSourceStatus {
@@ -352,15 +359,14 @@ impl<'a> TokenLogScanner<'a> {
         let mut source_statuses = roots
             .into_iter()
             .map(|root| {
+                let canonical_root = root.root.path.as_deref().map(canonical_or_owned);
                 let cached_count = cached_origins
                     .iter()
                     .filter(|(path, source)| {
                         *source == root.root.source
-                            && root
-                                .root
-                                .path
-                                .as_deref()
-                                .is_some_and(|root| path_is_under(path, root))
+                            && canonical_root
+                                .as_ref()
+                                .is_some_and(|root| Path::new(path).starts_with(root))
                     })
                     .count();
                 ScanSourceStatus {
@@ -463,10 +469,6 @@ fn has_local_details(event: &TokenEvent) -> bool {
     !event.raw_file_path.starts_with("sync://")
 }
 
-fn path_is_under(path: &str, root: &Path) -> bool {
-    Path::new(path).starts_with(canonical_or_owned(root))
-}
-
 fn canonical_or_owned(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_owned())
 }
@@ -514,7 +516,8 @@ fn enumerate_jsonl(
     source: TokenSource,
     is_cancelled: &impl Fn() -> bool,
 ) -> Enumeration {
-    match fs::metadata(root) {
+    let root = canonical_or_owned(root);
+    match fs::metadata(&root) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Enumeration {
                 files: Vec::new(),
@@ -538,7 +541,7 @@ fn enumerate_jsonl(
         }
         Ok(_) => {}
     }
-    let mut paths = vec![root.to_owned()];
+    let mut paths = vec![root];
     let mut files = Vec::new();
     let mut completed = true;
     let mut error_count = 0;
@@ -608,7 +611,7 @@ fn enumerate_jsonl(
             let modified_at: DateTime<Utc> = modified.into();
             files.push(LogFile {
                 snapshot: FileSnapshot {
-                    path: canonical_or_owned(&path).to_string_lossy().into_owned(),
+                    path: path.to_string_lossy().into_owned(),
                     source: Some(source),
                     size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
                     modified_at: modified

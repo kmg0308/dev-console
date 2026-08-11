@@ -450,7 +450,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
     if (!active) return;
     const refreshTimer = window.setInterval(() => {
       if (document.visibilityState === "visible" && !loadInFlight.current) refreshDashboard();
-    }, 60_000);
+    }, 5 * 60_000);
     const clockTimer = window.setInterval(() => setNow(Date.now()), 1_000);
     return () => {
       window.clearInterval(refreshTimer);

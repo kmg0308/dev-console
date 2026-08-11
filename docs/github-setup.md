@@ -7,11 +7,13 @@
 - macOS 14와 Windows Server 2022에서 TypeScript build, Rust format·clippy·test
 - 세 flavor의 macOS universal DMG를 임시 설치·기동하고, Windows Server 2022에서 x64 NSIS 설치·기동·제거 smoke를 수행
 
-macOS 14 runner 결과는 macOS 13 실제 동작 증거가 아니며, Windows runner 결과도 Windows용 compile·test·package 증거일 뿐 Windows 10 22H2 실제 동작 증거가 아닙니다. 저장소 보호 규칙은 모든 검사와 bundle job이 성공할 때만 통과하는 aggregate `verify`를 요구하고 Actions 권한은 read-only로 유지합니다. 이 저장소에는 자동 push, dependency PR, release workflow가 없습니다.
+macOS 14 runner 결과는 macOS 13 실제 동작 증거가 아니며, Windows runner 결과도 Windows용 compile·test·package 증거일 뿐 Windows 10 22H2 실제 동작 증거가 아닙니다. 저장소 보호 규칙은 모든 검사와 bundle job이 성공할 때만 통과하는 aggregate `verify`를 요구합니다. `main` push가 검증을 통과하면 `0.3.<workflow run number>` 버전의 unsigned 설치 파일과 updater 키로 서명한 DevConsole 업데이트를 GitHub Release에 게시합니다. Release 게시 job만 `contents: write` 권한을 사용합니다.
 
 ## Updater와 서명
 
-공용 Tauri 설정은 일반 개발·CI bundle에서 updater artifact를 만들지 않습니다. 승인된 production build만 다음 환경과 명령으로 서명 가능한 updater artifact를 만듭니다. endpoint URL path는 선택한 `<flavor>-<target>.json`으로 끝나야 합니다.
+공용 Tauri 설정은 일반 개발·pull request bundle에서 updater artifact를 만들지 않습니다. 자동 Release에는 Actions secret `TAURI_SIGNING_PRIVATE_KEY`와 같은 키의 public 부분인 Actions variable `TAURI_UPDATER_PUBLIC_KEY`가 필요합니다. private key는 저장소에 넣지 않으며, 이미 배포한 앱이 신뢰하므로 분실하거나 교체하면 기존 설치본은 새 키의 업데이트를 설치할 수 없습니다.
+
+별도 OS 코드 서명까지 포함하는 production build는 다음 환경과 명령을 사용합니다. endpoint URL path는 선택한 `<flavor>-<target>.json`으로 끝나야 합니다.
 
 - 공통 필수: `TAURI_UPDATER_PUBLIC_KEY`, HTTPS `TAURI_UPDATER_ENDPOINT`, updater artifact의 정확한 HTTPS `TAURI_UPDATER_ARTIFACT_URL`, `TAURI_SIGNING_PRIVATE_KEY`; 암호화된 updater key라면 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`도 설정
 - macOS 필수: Developer ID Application인 `APPLE_SIGNING_IDENTITY`와 notarization용 `APPLE_API_ISSUER`·`APPLE_API_KEY`·절대 경로 `APPLE_API_KEY_PATH`. RuntimeAtlas에는 같은 팀의 Developer ID Installer인 `INSTALLER_SIGN_IDENTITY`도 필요
@@ -42,9 +44,9 @@ npm run qa:updater:windows -- start runtime-atlas
 npm run qa:updater:windows -- start dev-console
 ```
 
-## 릴리스 게이트
+## OS 서명 릴리스 게이트
 
-외부 push, PR, release, 배포는 자동으로 수행하지 않습니다. 승인된 릴리스 작업도 다음 증거가 모두 있을 때만 진행합니다.
+Apple Developer와 Windows Authenticode 인증서를 사용하는 별도 production 릴리스는 다음 증거가 모두 있을 때만 진행합니다.
 
 - CI의 모든 check와 세 flavor package build 통과
 - macOS 13 이상에서 세 앱의 실제 기능 흐름 확인

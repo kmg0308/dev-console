@@ -308,17 +308,9 @@ impl TokenEventCache {
     }
 
     pub fn cached_file(&self, snapshot: &FileSnapshot) -> Result<Option<CachedFile>, CacheError> {
-        let Some(origin) = self.origin_file(OriginKind::LocalLog, &snapshot.path)? else {
+        let Some(origin) = self.current_local_origin(snapshot)? else {
             return Ok(None);
         };
-        if origin.file_size != snapshot.size
-            || (origin.modified_at - snapshot.modified_at).abs() >= 0.000_001
-            || origin.parser_version != CACHE_PARSER_VERSION
-            || origin.device_id != snapshot.device_id
-            || origin.source.as_deref().and_then(parse_source) != snapshot.source
-        {
-            return Ok(None);
-        }
         if origin.parse_error {
             return Ok(Some(CachedFile::ParseError));
         }
@@ -326,6 +318,12 @@ impl TokenEventCache {
             OriginKind::LocalLog,
             &snapshot.path,
         )?)))
+    }
+
+    pub fn has_current_local_events(&self, snapshot: &FileSnapshot) -> Result<bool, CacheError> {
+        Ok(self
+            .current_local_origin(snapshot)?
+            .is_some_and(|origin| !origin.parse_error))
     }
 
     pub fn incremental_append_base(
@@ -503,7 +501,8 @@ impl TokenEventCache {
                AND event.origin_path IN (SELECT origin_path FROM current)
                AND (?{cutoff} IS NULL OR event.timestamp >= ?{cutoff})
                AND event.origin_path = (
-                    SELECT MIN(first.origin_path) FROM event_records AS first
+                    SELECT MIN(first.origin_path)
+                    FROM event_records AS first INDEXED BY idx_event_records_identity
                     WHERE first.origin_kind = 'sync_ledger'
                       AND first.origin_path IN (SELECT origin_path FROM current)
                       AND first.device_id = event.device_id
@@ -790,6 +789,21 @@ impl TokenEventCache {
             .into_iter()
             .filter_map(|record| serde_json::from_slice(&record.event_json).ok())
             .collect())
+    }
+
+    fn current_local_origin(
+        &self,
+        snapshot: &FileSnapshot,
+    ) -> Result<Option<OriginFile>, CacheError> {
+        Ok(self
+            .origin_file(OriginKind::LocalLog, &snapshot.path)?
+            .filter(|origin| {
+                origin.file_size == snapshot.size
+                    && (origin.modified_at - snapshot.modified_at).abs() < 0.000_001
+                    && origin.parser_version == CACHE_PARSER_VERSION
+                    && origin.device_id == snapshot.device_id
+                    && origin.source.as_deref().and_then(parse_source) == snapshot.source
+            }))
     }
 
     pub fn mark_fixture_migrated(path: &Path, migration: &str) -> Result<(), CacheError> {
@@ -1229,6 +1243,31 @@ mod tests {
                 .events(DateTime::from_timestamp(1_774_915_201, 0))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn current_file_check_uses_only_origin_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            TokenEventCache::open_or_create(&directory.path().join("cache.sqlite")).unwrap();
+        insert_origin(&cache, "/cached/codex.jsonl", "codex");
+        let snapshot = FileSnapshot {
+            path: "/cached/codex.jsonl".into(),
+            source: Some(TokenSource::Codex),
+            size: 10,
+            modified_at: 1.0,
+            device_id: Some("mac-a".into()),
+        };
+
+        assert!(cache.has_current_local_events(&snapshot).unwrap());
+        assert!(
+            !cache
+                .has_current_local_events(&FileSnapshot {
+                    size: 11,
+                    ..snapshot
+                })
+                .unwrap()
         );
     }
 

@@ -7,7 +7,7 @@ use crate::CACHE_PARSER_VERSION;
 use crate::cache::{FileSnapshot, OriginKind, TokenEventCache};
 use crate::models::{SyncFolderStatus, TokenDeviceMetadata, TokenEvent};
 use crate::sync::{
-    LedgerRead, SyncLedgerRecord, read_ledger_cancelable,
+    LedgerRead, SyncLedgerRecord, dataless_ledger_snapshot, read_ledger_cancelable,
     requires_local_ledger_replacement_cancelable, safe_device_file_name,
     verified_direct_ledger_paths, verified_ledger_snapshot, write_local_ledger_v2_cached,
 };
@@ -60,7 +60,7 @@ impl<'a> TokenSyncStore<'a> {
         let paths = verified_direct_ledger_paths(&self.folder.join("devices")).ok()?;
         let mut cache_paths = Vec::with_capacity(paths.len());
         for ledger_path in &paths {
-            let Some(snapshot) = file_snapshot(ledger_path).ok() else {
+            let Some(snapshot) = cache_file_snapshot(ledger_path).ok().map(|value| value.0) else {
                 continue;
             };
             let cache_path = snapshot.path.clone();
@@ -370,7 +370,7 @@ fn reconcile_cached_ledger(
     cache: &TokenEventCache,
     is_cancelled: &mut impl FnMut() -> bool,
 ) -> Result<(bool, usize, String, Option<LedgerRead>), crate::sync::SyncError> {
-    let current = file_snapshot(path)?;
+    let (current, dataless) = cache_file_snapshot(path)?;
     let cache_path = current.path.clone();
     if let Ok(Some(origin)) = cache.origin_file(OriginKind::SyncLedger, &cache_path)
         && origin.parser_version == CACHE_PARSER_VERSION
@@ -386,6 +386,13 @@ fn reconcile_cached_ledger(
                 cache_path,
                 None,
             ));
+        }
+        if dataless
+            && identity_matches
+            && origin.file_size <= current.size
+            && current.modified_at + 0.000_001 >= origin.modified_at
+        {
+            return Ok((true, 1, cache_path, None));
         }
         if identity_matches
             && origin
@@ -437,6 +444,13 @@ fn reconcile_cached_ledger(
         }
     }
 
+    if dataless {
+        cache.remove_sync_origin(&cache_path).map_err(|error| {
+            crate::sync::SyncError::Io(std::io::Error::other(error.to_string()))
+        })?;
+        return Ok((true, 1, cache_path, None));
+    }
+
     let ledger = read_ledger_cancelable(path, 0, &mut *is_cancelled)?;
     if is_cancelled() {
         return Err(crate::sync::SyncError::Cancelled);
@@ -472,6 +486,13 @@ fn read_ledgers_uncached(
             break;
         }
         read.device_file_count += 1;
+        match dataless_ledger_snapshot(&path) {
+            Ok(Some(_)) | Err(_) => {
+                read.parse_error_count += 1;
+                continue;
+            }
+            Ok(None) => {}
+        }
         let ledger = prefetched
             .iter()
             .position(|(prefetched_path, _)| prefetched_path == &path)
@@ -545,16 +566,32 @@ fn cached_writer_hint(
 
 fn file_snapshot(path: &Path) -> Result<FileSnapshot, crate::sync::SyncError> {
     let (canonical, size, modified, identity) = verified_ledger_snapshot(path)?;
+    Ok(snapshot(canonical, size, modified, identity))
+}
+
+fn cache_file_snapshot(path: &Path) -> Result<(FileSnapshot, bool), crate::sync::SyncError> {
+    if let Some((canonical, size, modified, identity)) = dataless_ledger_snapshot(path)? {
+        return Ok((snapshot(canonical, size, modified, identity), true));
+    }
+    file_snapshot(path).map(|snapshot| (snapshot, false))
+}
+
+fn snapshot(
+    canonical: PathBuf,
+    size: u64,
+    modified: std::time::SystemTime,
+    identity: String,
+) -> FileSnapshot {
     let modified_at = modified
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64());
-    Ok(FileSnapshot {
+    FileSnapshot {
         path: canonical.to_string_lossy().into_owned(),
         source: None,
         size: i64::try_from(size).unwrap_or(i64::MAX),
         modified_at,
         device_id: Some(identity),
-    })
+    }
 }
 
 fn read_snapshot(
