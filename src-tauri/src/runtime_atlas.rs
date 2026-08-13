@@ -53,7 +53,8 @@ pub struct RuntimeAtlasState {
     store: ConfigurationStore,
     sessions: ActionSessionStore,
     paths: RuntimeAtlasPaths,
-    _lease: RuntimeAtlasProcessLease,
+    _lease: Mutex<Option<RuntimeAtlasProcessLease>>,
+    startup_error: Option<String>,
     default_language: AppLanguage,
     memory: Arc<Mutex<RuntimeMemory>>,
     // ponytail: one operation lock keeps rare action transitions atomic; split per key if latency matters.
@@ -139,18 +140,24 @@ pub fn initialize(app: &AppHandle) -> Result<RuntimeAtlasState, String> {
         return Err("Updater QA local data isolation is unavailable".to_owned());
     }
     let base = isolated.unwrap_or(local_data);
-    RuntimeAtlasState::new(base, system_language())
+    let language = system_language();
+    match RuntimeAtlasState::new(base.clone(), language) {
+        Ok(state) => Ok(state),
+        Err(error) => Ok(RuntimeAtlasState::unavailable(base, language, error)),
+    }
 }
 
 impl RuntimeAtlasState {
     fn new(directory: PathBuf, default_language: AppLanguage) -> Result<Self, String> {
         let paths = RuntimeAtlasPaths::new(directory);
         prepare_private_directory(&paths.action_session_markers_directory)?;
+        let lease = RuntimeAtlasProcessLease::try_acquire(&paths).map_err(string_error)?;
         Ok(Self {
             store: ConfigurationStore::new(&paths),
             sessions: ActionSessionStore::new(&paths),
             paths: paths.clone(),
-            _lease: RuntimeAtlasProcessLease::try_acquire(&paths).map_err(string_error)?,
+            _lease: Mutex::new(Some(lease)),
+            startup_error: None,
             default_language,
             memory: Arc::new(Mutex::new(RuntimeMemory::default())),
             action_operation: Mutex::new(()),
@@ -158,6 +165,56 @@ impl RuntimeAtlasState {
             #[cfg(target_os = "macos")]
             login_environment: OnceLock::new(),
         })
+    }
+
+    fn unavailable(directory: PathBuf, default_language: AppLanguage, error: String) -> Self {
+        let paths = RuntimeAtlasPaths::new(directory);
+        let startup_error = if error.contains("busy or cannot be locked") {
+            "Runtime Atlas could not access its shared local data. Close any other DevConsole or Runtime Atlas window, then press Retry. If no other window is open, check the Runtime Atlas data directory permissions.".to_owned()
+        } else {
+            error
+        };
+        Self {
+            store: ConfigurationStore::new(&paths),
+            sessions: ActionSessionStore::new(&paths),
+            paths,
+            _lease: Mutex::new(None),
+            startup_error: Some(startup_error),
+            default_language,
+            memory: Arc::new(Mutex::new(RuntimeMemory::default())),
+            action_operation: Mutex::new(()),
+            update_shutdown: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            login_environment: OnceLock::new(),
+        }
+    }
+
+    fn ensure_available(&self) -> Result<(), String> {
+        let mut lease = self
+            ._lease
+            .lock()
+            .map_err(|_| "Runtime Atlas startup lock is poisoned".to_owned())?;
+        if lease.is_some() {
+            return Ok(());
+        }
+        prepare_private_directory(&self.paths.action_session_markers_directory)?;
+        match RuntimeAtlasProcessLease::try_acquire(&self.paths) {
+            Ok(value) => {
+                *lease = Some(value);
+                Ok(())
+            }
+            Err(error) => Err(self
+                .startup_error
+                .clone()
+                .unwrap_or_else(|| string_error(error))),
+        }
+    }
+
+    fn has_lease(&self) -> Result<bool, String> {
+        self._lease
+            .lock()
+            .map(|lease| lease.is_some())
+            .map_err(|_| "Runtime Atlas startup lock is poisoned".to_owned())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, RuntimeMemory>, String> {
@@ -1315,10 +1372,14 @@ impl RuntimeAtlasState {
     }
 
     pub fn shutdown_for_update(&self) -> Result<(), String> {
+        self.ensure_available()?;
         self.shutdown_for_update_with(&supervisor_executable()?)
     }
 
     pub fn shutdown_for_exit(&self) -> Result<(), String> {
+        if !self.has_lease()? {
+            return Ok(());
+        }
         let _operation = self
             .action_operation
             .lock()
@@ -1643,6 +1704,7 @@ impl RuntimeAtlasState {
 pub fn runtime_atlas_status(
     state: State<'_, RuntimeAtlasState>,
 ) -> Result<RuntimeAtlasSnapshot, String> {
+    state.ensure_available()?;
     state.status()
 }
 
@@ -1651,6 +1713,7 @@ pub fn runtime_atlas_add_repository(
     state: State<'_, RuntimeAtlasState>,
     path: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.add_repository(&path)
 }
 
@@ -1659,6 +1722,7 @@ pub fn runtime_atlas_remove_repository(
     state: State<'_, RuntimeAtlasState>,
     repository_id: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.remove_repository(Uuid::parse_str(&repository_id).map_err(string_error)?)
 }
 
@@ -1667,6 +1731,7 @@ pub fn runtime_atlas_set_language(
     state: State<'_, RuntimeAtlasState>,
     language: AppLanguage,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.store.set_app_language(language).map_err(string_error)
 }
 
@@ -1675,6 +1740,7 @@ pub fn runtime_atlas_save_action(
     state: State<'_, RuntimeAtlasState>,
     action: CustomActionDefinition,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.save_action(action)
 }
 
@@ -1683,6 +1749,7 @@ pub fn runtime_atlas_delete_action(
     state: State<'_, RuntimeAtlasState>,
     action_id: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.delete_action(Uuid::parse_str(&action_id).map_err(string_error)?)
 }
 
@@ -1694,6 +1761,7 @@ pub fn runtime_atlas_plan_action(
     values: BTreeMap<String, ActionInputValue>,
     restart: bool,
 ) -> Result<ActionConfirmationPlan, String> {
+    state.ensure_available()?;
     state.plan_action(
         Uuid::parse_str(&action_id).map_err(string_error)?,
         &worktree_path,
@@ -1707,6 +1775,7 @@ pub fn runtime_atlas_confirm_action(
     state: State<'_, RuntimeAtlasState>,
     confirmation_token: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.confirm_action(Uuid::parse_str(&confirmation_token).map_err(string_error)?)
 }
 
@@ -1716,6 +1785,7 @@ pub fn runtime_atlas_set_worktree_order(
     repository_id: String,
     keys: Vec<String>,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.set_worktree_order(
         Uuid::parse_str(&repository_id).map_err(string_error)?,
         &keys,
@@ -1728,6 +1798,7 @@ pub fn runtime_atlas_stop_action(
     action_id: String,
     worktree_path: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.stop_action(
         Uuid::parse_str(&action_id).map_err(string_error)?,
         &worktree_path,
@@ -1740,6 +1811,7 @@ pub fn runtime_atlas_stop_process(
     process_identity: ProcessIdentity,
     worktree_path: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.stop_process(&process_identity, &worktree_path)
 }
 
@@ -1749,6 +1821,7 @@ pub fn runtime_atlas_link_process(
     process_identity: ProcessIdentity,
     worktree_path: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.link_process(process_identity, &worktree_path)
 }
 
@@ -1757,6 +1830,7 @@ pub fn runtime_atlas_unlink_process(
     state: State<'_, RuntimeAtlasState>,
     process_identity: ProcessIdentity,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.unlink_process(&process_identity)
 }
 
@@ -1766,6 +1840,7 @@ pub fn runtime_atlas_advance_worktree_navigation(
     current_path: Option<String>,
     forward: bool,
 ) -> Result<Option<String>, String> {
+    state.ensure_available()?;
     state.advance_navigation(current_path.as_deref(), forward)
 }
 
@@ -1773,6 +1848,7 @@ pub fn runtime_atlas_advance_worktree_navigation(
 pub fn runtime_atlas_commit_worktree_navigation(
     state: State<'_, RuntimeAtlasState>,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.commit_navigation()
 }
 
@@ -1780,6 +1856,7 @@ pub fn runtime_atlas_commit_worktree_navigation(
 pub fn runtime_atlas_cancel_worktree_navigation(
     state: State<'_, RuntimeAtlasState>,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.cancel_navigation()
 }
 
@@ -1788,6 +1865,7 @@ pub fn runtime_atlas_record_worktree_selection(
     state: State<'_, RuntimeAtlasState>,
     path: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.record_selection(&path)
 }
 
@@ -1796,6 +1874,7 @@ pub fn runtime_atlas_open_worktree_in_vscode(
     state: State<'_, RuntimeAtlasState>,
     path: String,
 ) -> Result<(), String> {
+    state.ensure_available()?;
     state.open_worktree_in_vscode(&path)
 }
 
@@ -2866,6 +2945,27 @@ mod tests {
         assert_eq!(snapshot.language, AppLanguage::English);
         drop(state);
         assert!(RuntimeAtlasState::new(data, AppLanguage::English).is_ok());
+    }
+
+    #[test]
+    fn unavailable_state_reports_startup_error_without_taking_the_lease() {
+        let directory = tempdir().unwrap();
+        let data = directory.path().join("Runtime Atlas");
+        let holder = RuntimeAtlasState::new(data.clone(), AppLanguage::English).unwrap();
+        let state = RuntimeAtlasState::unavailable(
+            data.clone(),
+            AppLanguage::English,
+            "Runtime Atlas local data is busy or cannot be locked.".to_owned(),
+        );
+
+        assert_eq!(
+            state.ensure_available().unwrap_err(),
+            "Runtime Atlas could not access its shared local data. Close any other DevConsole or Runtime Atlas window, then press Retry. If no other window is open, check the Runtime Atlas data directory permissions."
+        );
+        assert!(state.shutdown_for_update().is_err());
+        assert!(state.shutdown_for_exit().is_ok());
+        drop(holder);
+        assert!(state.ensure_available().is_ok());
     }
 
     #[test]
