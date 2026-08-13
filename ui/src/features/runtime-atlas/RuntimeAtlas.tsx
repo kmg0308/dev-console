@@ -368,6 +368,13 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
   const text = (ko: string, en: string) => korean ? ko : en;
   const sessionActions = snapshot.actions.filter((action) => action.repositoryID === repository.id && action.kind === "session");
   const [draggedPath, setDraggedPath] = useState<string>();
+  const draggedPathRef = useRef<string | undefined>(undefined);
+  const clearDrag = () => {
+    draggedPathRef.current = undefined;
+    setDraggedPath(undefined);
+  };
+  const dragSourcePath = (dataTransfer: DataTransfer) =>
+    dataTransfer.getData("text/plain") || draggedPathRef.current;
   const move = (index: number, offset: number) => {
     const worktrees = [...repository.worktrees];
     [worktrees[index], worktrees[index + offset]] = [worktrees[index + offset], worktrees[index]];
@@ -405,30 +412,24 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
         const ports = [...new Set(linkedProcesses.flatMap((process) => process.ports.map((port) => port.port)))];
         return <div
           className={`atlas-worktree-row${selectedPath === worktree.path ? " selected" : ""}${draggedPath === worktree.path ? " dragging" : ""}`}
-          draggable={!busy}
           key={worktree.path}
-          onDragEnd={() => setDraggedPath(undefined)}
           onDragOver={(event) => {
-            if (!draggedPath || draggedPath === worktree.path) return;
+            const sourcePath = dragSourcePath(event.dataTransfer);
+            if (!sourcePath || sourcePath === worktree.path) return;
             event.preventDefault();
             event.dataTransfer.dropEffect = "move";
           }}
-          onDragStart={(event) => {
-            if (busy) return event.preventDefault();
-            setDraggedPath(worktree.path);
-            event.dataTransfer.effectAllowed = "move";
-            event.dataTransfer.setData("text/plain", worktree.path);
-          }}
           onDrop={(event) => {
             event.preventDefault();
-            if (!draggedPath || draggedPath === worktree.path) return;
+            const sourcePath = dragSourcePath(event.dataTransfer);
+            clearDrag();
+            if (!sourcePath || sourcePath === worktree.path) return;
             const worktrees = [...repository.worktrees];
-            const source = worktrees.findIndex((item) => item.path === draggedPath);
+            const source = worktrees.findIndex((item) => item.path === sourcePath);
             const target = worktrees.findIndex((item) => item.path === worktree.path);
             if (source < 0 || target < 0) return;
             const [moved] = worktrees.splice(source, 1);
             worktrees.splice(target, 0, moved);
-            setDraggedPath(undefined);
             reorder(worktrees.map((item) => item.path));
           }}
         >
@@ -436,7 +437,16 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
             type="button"
             className="atlas-worktree-button"
             aria-current={selectedPath === worktree.path ? "page" : undefined}
+            draggable={!busy}
             onClick={() => select(worktree.path)}
+            onDragEnd={clearDrag}
+            onDragStart={(event) => {
+              if (busy) return event.preventDefault();
+              draggedPathRef.current = worktree.path;
+              setDraggedPath(worktree.path);
+              event.dataTransfer.effectAllowed = "move";
+              event.dataTransfer.setData("text/plain", worktree.path);
+            }}
           >
             <i className={`atlas-worktree-rail ${selectedPath === worktree.path ? "selected" : ""} ${worktree.availability}`} aria-hidden="true" />
             <span><strong>{leafName(worktree.path)}</strong>{worktree.dirty && <Circle className="atlas-dirty-dot" weight="fill" aria-label={text("변경 있음", "Dirty")} />}</span>
