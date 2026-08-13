@@ -6,11 +6,12 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc --noEmit && vite build",
-    "check": "npm run build && npm run test:release && npm run test:release-signature && npm run test:updater:windows",
+    "check": "npm run build && npm run test:runtime-atlas:reorder && npm run test:release && npm run test:release-signature && npm run test:updater:windows",
     "sidecars": "node scripts/prepare-sidecars.mjs",
     "build:runtime": "npm run build && npm run sidecars",
     "package:runtime-atlas:macos": "bash scripts/package-runtime-atlas-macos.sh",
     "test:runtime-atlas:macos-package": "bash scripts/test-runtime-atlas-macos-package.sh",
+    "test:runtime-atlas:reorder": "node ui/src/features/runtime-atlas/reorder.ts",
     "verify:runtime-atlas:macos-package": "bash scripts/verify-runtime-atlas-macos-package.sh",
     "qa:updater:macos": "node scripts/prepare-updater-macos-qa.mjs",
     "qa:updater:windows": "node scripts/prepare-updater-windows-qa.mjs",

@@ -25,6 +25,7 @@ import {
 import { ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { pickDirectory } from "../../folder-dialog";
 import "./RuntimeAtlas.css";
+import { movePath } from "./reorder";
 import {
   ActionConfirmationPlan,
   ActionRun,
@@ -368,15 +369,33 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
   const text = (ko: string, en: string) => korean ? ko : en;
   const sessionActions = snapshot.actions.filter((action) => action.repositoryID === repository.id && action.kind === "session");
   const [draggedPath, setDraggedPath] = useState<string>();
-  const draggedPathRef = useRef<string | undefined>(undefined);
-  const clearDrag = () => {
-    draggedPathRef.current = undefined;
+  const [previewOrder, setPreviewOrder] = useState<string[]>();
+  const pointerDrag = useRef<{ pointerId: number; path: string; startY: number; moved: boolean; order: string[] } | undefined>(undefined);
+  const suppressClick = useRef(false);
+  const orderedWorktrees = previewOrder
+    ? previewOrder.flatMap((path) => repository.worktrees.find((worktree) => worktree.path === path) ?? [])
+    : repository.worktrees;
+
+  useEffect(() => {
+    if (!pointerDrag.current) setPreviewOrder(undefined);
+  }, [repository.worktrees]);
+
+  const finishDrag = (pointerId: number, canceled = false) => {
+    const drag = pointerDrag.current;
+    if (!drag || drag.pointerId !== pointerId) return;
+    pointerDrag.current = undefined;
     setDraggedPath(undefined);
+    if (!drag.moved || canceled) {
+      setPreviewOrder(undefined);
+      return;
+    }
+    suppressClick.current = true;
+    window.setTimeout(() => { suppressClick.current = false; });
+    if (drag.order.some((path, index) => path !== repository.worktrees[index]?.path)) reorder(drag.order);
+    else setPreviewOrder(undefined);
   };
-  const dragSourcePath = (dataTransfer: DataTransfer) =>
-    dataTransfer.getData("text/plain") || draggedPathRef.current;
   const move = (index: number, offset: number) => {
-    const worktrees = [...repository.worktrees];
+    const worktrees = [...orderedWorktrees];
     [worktrees[index], worktrees[index + offset]] = [worktrees[index + offset], worktrees[index]];
     reorder(worktrees.map((worktree) => worktree.path));
   };
@@ -398,7 +417,7 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
       )}
       {repository.worktrees.length === 0 ? (
         <p className="atlas-empty">{text("워크트리를 찾지 못했습니다.", "No worktrees found.")}</p>
-      ) : repository.worktrees.map((worktree, index) => {
+      ) : orderedWorktrees.map((worktree, index) => {
         const managedRun = snapshot.actionRuns.some((run) =>
           sessionActions.some((action) => action.id === run.actionID)
           && run.worktreePath === worktree.path
@@ -412,41 +431,41 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
         const ports = [...new Set(linkedProcesses.flatMap((process) => process.ports.map((port) => port.port)))];
         return <div
           className={`atlas-worktree-row${selectedPath === worktree.path ? " selected" : ""}${draggedPath === worktree.path ? " dragging" : ""}`}
+          data-worktree-path={worktree.path}
           key={worktree.path}
-          onDragOver={(event) => {
-            const sourcePath = dragSourcePath(event.dataTransfer);
-            if (!sourcePath || sourcePath === worktree.path) return;
-            event.preventDefault();
-            event.dataTransfer.dropEffect = "move";
-          }}
-          onDrop={(event) => {
-            event.preventDefault();
-            const sourcePath = dragSourcePath(event.dataTransfer);
-            clearDrag();
-            if (!sourcePath || sourcePath === worktree.path) return;
-            const worktrees = [...repository.worktrees];
-            const source = worktrees.findIndex((item) => item.path === sourcePath);
-            const target = worktrees.findIndex((item) => item.path === worktree.path);
-            if (source < 0 || target < 0) return;
-            const [moved] = worktrees.splice(source, 1);
-            worktrees.splice(target, 0, moved);
-            reorder(worktrees.map((item) => item.path));
-          }}
         >
           <button
             type="button"
             className="atlas-worktree-button"
             aria-current={selectedPath === worktree.path ? "page" : undefined}
-            draggable={!busy}
-            onClick={() => select(worktree.path)}
-            onDragEnd={clearDrag}
-            onDragStart={(event) => {
-              if (busy) return event.preventDefault();
-              draggedPathRef.current = worktree.path;
-              setDraggedPath(worktree.path);
-              event.dataTransfer.effectAllowed = "move";
-              event.dataTransfer.setData("text/plain", worktree.path);
+            onClick={() => {
+              if (!suppressClick.current) select(worktree.path);
             }}
+            onPointerCancel={(event) => finishDrag(event.pointerId, true)}
+            onPointerDown={(event) => {
+              if (busy || event.button !== 0) return;
+              event.currentTarget.setPointerCapture(event.pointerId);
+              pointerDrag.current = {
+                pointerId: event.pointerId,
+                path: worktree.path,
+                startY: event.clientY,
+                moved: false,
+                order: repository.worktrees.map((item) => item.path),
+              };
+            }}
+            onPointerMove={(event) => {
+              const drag = pointerDrag.current;
+              if (!drag || drag.pointerId !== event.pointerId) return;
+              if (!drag.moved && Math.abs(event.clientY - drag.startY) < 4) return;
+              event.preventDefault();
+              drag.moved = true;
+              setDraggedPath(drag.path);
+              const targetPath = document.elementFromPoint(event.clientX, event.clientY)
+                ?.closest<HTMLElement>("[data-worktree-path]")?.dataset.worktreePath;
+              if (!targetPath || !movePath(drag.order, drag.path, targetPath)) return;
+              setPreviewOrder([...drag.order]);
+            }}
+            onPointerUp={(event) => finishDrag(event.pointerId)}
           >
             <i className={`atlas-worktree-rail ${selectedPath === worktree.path ? "selected" : ""} ${worktree.availability}`} aria-hidden="true" />
             <span><strong>{leafName(worktree.path)}</strong>{worktree.dirty && <Circle className="atlas-dirty-dot" weight="fill" aria-label={text("변경 있음", "Dirty")} />}</span>
@@ -456,7 +475,7 @@ function RepositoryGroup({ repository, snapshot, selectedPath, select, remove, r
           <div className="atlas-worktree-order">
             <IconButton label={text(`${leafName(worktree.path)}을 VS Code로 열기`, `Open ${leafName(worktree.path)} in VS Code`)} disabled={busy || worktree.availability !== "available"} onClick={() => open(worktree.path)}><Code /></IconButton>
             <IconButton label={text(`${leafName(worktree.path)} 위로 이동`, `Move ${leafName(worktree.path)} up`)} disabled={busy || index === 0} onClick={() => move(index, -1)}><ArrowUp /></IconButton>
-            <IconButton label={text(`${leafName(worktree.path)} 아래로 이동`, `Move ${leafName(worktree.path)} down`)} disabled={busy || index === repository.worktrees.length - 1} onClick={() => move(index, 1)}><ArrowDown /></IconButton>
+            <IconButton label={text(`${leafName(worktree.path)} 아래로 이동`, `Move ${leafName(worktree.path)} down`)} disabled={busy || index === orderedWorktrees.length - 1} onClick={() => move(index, 1)}><ArrowDown /></IconButton>
           </div>
         </div>
       })}
