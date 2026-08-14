@@ -44,4 +44,6 @@ npm run check
 cargo test --workspace --all-features --locked
 ```
 
+Rust 산출물이 커지면 `npm run clean:rust`로 `target`의 모든 Cargo 산출물을 정리합니다. 배포 파일도 삭제되므로 필요하면 먼저 보관하세요.
+
 서명과 릴리스 설정은 [GitHub 설정](docs/github-setup.md)을 참고하세요.

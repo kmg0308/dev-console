@@ -15,6 +15,7 @@
     "verify:runtime-atlas:macos-package": "bash scripts/verify-runtime-atlas-macos-package.sh",
     "qa:updater:macos": "node scripts/prepare-updater-macos-qa.mjs",
     "qa:updater:windows": "node scripts/prepare-updater-windows-qa.mjs",
+    "clean:rust": "cargo clean",
     "release": "node scripts/build-release.mjs",
     "test:release": "node scripts/build-release.mjs --self-test",
     "test:release-signature": "node scripts/build-release.mjs --self-test-signature",
