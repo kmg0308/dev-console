@@ -142,6 +142,8 @@
 .atlas-card > header h3, .atlas-card > header h4 { margin: 0 0 3px; font-size: 17px; }
 .atlas-card > header p { margin: 0; color: var(--atlas-secondary); font-size: 13px; }
 .atlas-card-body { padding: 18px; }
+.atlas-repository-actions > header code { max-width: 45%; overflow: hidden; color: var(--atlas-secondary); text-overflow: ellipsis; white-space: nowrap; }
+.atlas-repository-actions > .atlas-card-body { padding: 12px 18px; }
 .atlas-runtime-list { position: relative; }
 .atlas-runtime-list::before { position: absolute; top: 42px; bottom: 42px; left: 30px; width: 1px; content: ""; background: rgba(107, 199, 245, 0.22); }
 .atlas-runtime-row { position: relative; display: grid; grid-template-columns: 32px minmax(160px, 1fr) auto auto; align-items: center; gap: 12px; min-height: 52px; padding: 10px 0; }
@@ -198,7 +200,12 @@
 .atlas-manager-row > div:first-child { flex: 1; display: grid; gap: 3px; }
 .atlas-manager-row code { color: var(--atlas-secondary); overflow-wrap: anywhere; }
 .atlas-manager-row > div:last-child { display: flex; align-items: center; gap: 4px; }
-.atlas-add-command { display: flex; align-items: center; gap: 7px; justify-self: start; }
+.atlas-manager-section { display: grid; gap: 8px; }
+.atlas-manager-section + .atlas-manager-section { padding-top: 14px; border-top: 1px solid var(--atlas-border); }
+.atlas-manager-section > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.atlas-manager-section > header h4, .atlas-manager-section > header p { margin: 0; }
+.atlas-manager-section > header p { margin-top: 3px; color: var(--atlas-secondary); font-size: 12px; }
+.atlas-add-command { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; }
 .atlas-output-dialog { padding: 20px; }
 .atlas-output-dialog > header { margin: -20px -20px 14px; }
 .atlas-output-dialog > code { color: var(--atlas-secondary); }
