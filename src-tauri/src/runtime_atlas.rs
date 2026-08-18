@@ -5,8 +5,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-#[cfg(target_os = "macos")]
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -60,8 +58,6 @@ pub struct RuntimeAtlasState {
     // ponytail: one operation lock keeps rare action transitions atomic; split per key if latency matters.
     action_operation: Mutex<()>,
     update_shutdown: AtomicBool,
-    #[cfg(target_os = "macos")]
-    login_environment: OnceLock<Result<Vec<(OsString, OsString)>, String>>,
 }
 
 #[derive(Default)]
@@ -162,8 +158,6 @@ impl RuntimeAtlasState {
             memory: Arc::new(Mutex::new(RuntimeMemory::default())),
             action_operation: Mutex::new(()),
             update_shutdown: AtomicBool::new(false),
-            #[cfg(target_os = "macos")]
-            login_environment: OnceLock::new(),
         })
     }
 
@@ -184,8 +178,6 @@ impl RuntimeAtlasState {
             memory: Arc::new(Mutex::new(RuntimeMemory::default())),
             action_operation: Mutex::new(()),
             update_shutdown: AtomicBool::new(false),
-            #[cfg(target_os = "macos")]
-            login_environment: OnceLock::new(),
         }
     }
 
@@ -410,15 +402,6 @@ impl RuntimeAtlasState {
         self.store
             .remove_repository(repository_id)
             .map_err(string_error)
-    }
-
-    #[cfg(target_os = "macos")]
-    fn login_environment(&self) -> Result<&[(OsString, OsString)], String> {
-        self.login_environment
-            .get_or_init(resolve_login_environment)
-            .as_ref()
-            .map(Vec::as_slice)
-            .map_err(Clone::clone)
     }
 
     fn status(&self) -> Result<RuntimeAtlasSnapshot, String> {
@@ -1095,7 +1078,7 @@ impl RuntimeAtlasState {
         self.remove_stale_record_for_key(&key)?;
         let supervisor_executable = supervisor_executable()?;
         #[cfg(target_os = "macos")]
-        let supervisor_environment = self.login_environment()?;
+        let supervisor_environment = resolve_login_environment(Path::new(&plan.current_directory))?;
 
         let session_id = (action.kind == CustomActionKind::Session).then(Uuid::new_v4);
         let marker_path = session_id.map(|id| self.marker_path(id));
@@ -1159,7 +1142,7 @@ impl RuntimeAtlasState {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(target_os = "macos")]
-        apply_supervisor_environment(&mut command, supervisor_environment);
+        apply_supervisor_environment(&mut command, &supervisor_environment);
         configure_supervisor_launch(&mut command);
 
         if let Err(error) = self.revalidate_action_confirmation(confirmation) {
@@ -2055,7 +2038,9 @@ fn string_error(error: impl std::fmt::Display) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn resolve_login_environment() -> Result<Vec<(OsString, OsString)>, String> {
+fn resolve_login_environment(
+    current_directory: &Path,
+) -> Result<Vec<(OsString, OsString)>, String> {
     use std::{ffi::CStr, os::unix::ffi::OsStringExt};
 
     let entry = unsafe { libc::getpwuid(libc::geteuid()) };
@@ -2070,19 +2055,22 @@ fn resolve_login_environment() -> Result<Vec<(OsString, OsString)>, String> {
     if shell.is_empty() {
         return Err("login shell is unavailable".to_owned());
     }
-    read_login_environment(&shell, Duration::from_secs(15))
+    read_login_environment(&shell, current_directory, Duration::from_secs(15))
 }
 
 #[cfg(target_os = "macos")]
 fn read_login_environment(
     shell: &std::ffi::OsStr,
+    current_directory: &Path,
     timeout: Duration,
 ) -> Result<Vec<(OsString, OsString)>, String> {
     use std::os::unix::ffi::OsStringExt;
 
     const MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
     let output = output_with_timeout(
-        Command::new(shell).args(["-l", "-c", "/usr/bin/env -0"]),
+        Command::new(shell)
+            .args(["-l", "-c", "/usr/bin/env -0"])
+            .current_dir(current_directory),
         timeout,
     )
     .map_err(|error| format!("login shell environment could not be loaded: {error}"))?;
@@ -2844,37 +2832,36 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn host_caches_login_environment_and_applies_it_before_supervisor_launch() {
+    fn host_reads_login_environment_from_action_directory() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempdir().unwrap();
+        let worktree = directory.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
         let shell = directory.path().join("login-shell");
         fs::write(
             &shell,
-            "#!/bin/sh\n[ \"$1\" = -l ] && [ \"$2\" = -c ] && [ \"$3\" = '/usr/bin/env -0' ] || exit 9\nprintf 'PATH=/fixture/bin\\0RUNTIME_ATLAS_HOST_ENV=fixture-value\\0'\n",
+            "#!/bin/sh\n[ \"$1\" = -l ] && [ \"$2\" = -c ] && [ \"$3\" = '/usr/bin/env -0' ] || exit 9\nprintf 'PATH=/fixture/bin\\0RUNTIME_ATLAS_HOST_ENV=%s\\0' \"$PWD\"\n",
         )
         .unwrap();
         fs::set_permissions(&shell, fs::Permissions::from_mode(0o755)).unwrap();
         let environment =
-            read_login_environment(shell.as_os_str(), Duration::from_secs(1)).unwrap();
-        let state =
-            RuntimeAtlasState::new(directory.path().join("Runtime Atlas"), AppLanguage::English)
-                .unwrap();
-        state.login_environment.set(Ok(environment)).unwrap();
-        let first = state.login_environment().unwrap();
-        let second = state.login_environment().unwrap();
-        assert!(std::ptr::eq(first, second));
+            read_login_environment(shell.as_os_str(), &worktree, Duration::from_secs(1)).unwrap();
 
         let mut command = Command::new("/usr/bin/env");
         command.arg("-0");
-        apply_supervisor_environment(&mut command, first);
+        apply_supervisor_environment(&mut command, &environment);
         let output = command.output().unwrap();
         assert!(output.status.success());
+        let expected = format!(
+            "RUNTIME_ATLAS_HOST_ENV={}",
+            fs::canonicalize(&worktree).unwrap().display()
+        );
         assert!(
             output
                 .stdout
                 .split(|byte| *byte == 0)
-                .any(|entry| entry == b"RUNTIME_ATLAS_HOST_ENV=fixture-value")
+                .any(|entry| entry == expected.as_bytes())
         );
     }
 
