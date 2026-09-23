@@ -99,14 +99,19 @@ pub fn parse_codex_file(
 
             let usage = if let Some(total) = total {
                 let current_total = codex_usage(total);
+                let last_usage = last.map(codex_usage);
                 let usage = if let Some(previous_total) = previous_total {
-                    if current_total.total < previous_total.total {
-                        last.map(codex_usage).unwrap_or(current_total)
+                    let delta = current_total.total.saturating_sub(previous_total.total);
+                    if current_total.total < previous_total.total
+                        || (current_total.total > previous_total.total
+                            && last_usage.is_some_and(|usage| usage.total > delta))
+                    {
+                        last_usage.unwrap_or(current_total)
                     } else {
                         delta_usage(current_total, previous_total)
                     }
-                } else if let Some(last) = last {
-                    codex_usage(last)
+                } else if let Some(last_usage) = last_usage {
+                    last_usage
                 } else {
                     current_total
                 };
@@ -484,6 +489,8 @@ mod tests {
             "\n",
             r#"{"timestamp":"2026-01-01T00:00:07Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":11,"total_tokens":11},"last_token_usage":{"input_tokens":4,"total_tokens":4}}}}"#,
             "\n",
+            r#"{"timestamp":"2026-01-01T00:00:08Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"total_tokens":20},"last_token_usage":{"input_tokens":20,"total_tokens":20}}}}"#,
+            "\n",
         );
         let file = fixture(initial);
         let offset = initial.len() as u64;
@@ -495,20 +502,20 @@ mod tests {
             full.iter()
                 .map(|event| event.usage.total)
                 .collect::<Vec<_>>(),
-            [10, 5, 7, 4]
+            [10, 5, 7, 4, 20]
         );
         assert_eq!(tail, full[1..]);
         assert_eq!(
             tail.iter()
                 .map(|event| event.model.as_str())
                 .collect::<Vec<_>>(),
-            ["gpt-sol", "gpt-luna", "gpt-luna"]
+            ["gpt-sol", "gpt-luna", "gpt-luna", "gpt-luna"]
         );
         assert_eq!(
             tail.iter()
                 .map(|event| event.project_path.as_str())
                 .collect::<Vec<_>>(),
-            ["/old", "/new", "/new"]
+            ["/old", "/new", "/new", "/new"]
         );
         assert!(matches!(
             parse_codex_file(file.path(), offset - 1, || false),
