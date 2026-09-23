@@ -17,5 +17,5 @@ pub mod settings;
 pub mod sync;
 pub mod sync_store;
 
-pub const CACHE_PARSER_VERSION: i64 = 4;
+pub const CACHE_PARSER_VERSION: i64 = 5;
 pub const SYNC_SCHEMA_VERSION: u32 = 2;

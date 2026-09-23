@@ -251,12 +251,19 @@ impl<'a> TokenSyncStore<'a> {
         if !path.try_exists()? {
             return Ok(true);
         }
-        if self
-            .cache
-            .and_then(|cache| cached_v2_snapshot(cache, &path))
-            .is_some()
-        {
-            return Ok(false);
+        if let Some(cache) = self.cache {
+            let (snapshot, _) = cache_file_snapshot(&path)?;
+            if cache
+                .origin_file(OriginKind::SyncLedger, &snapshot.path)
+                .ok()
+                .flatten()
+                .is_none_or(|origin| origin.parser_version != CACHE_PARSER_VERSION)
+            {
+                return Ok(true);
+            }
+            if cached_v2_snapshot(cache, &path).is_some() {
+                return Ok(false);
+            }
         }
         requires_local_ledger_replacement_cancelable(&path, &mut is_cancelled)
     }
@@ -737,6 +744,42 @@ mod tests {
         let merged = merge_local_and_sync([local.clone()], outcome.events);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0], local);
+    }
+
+    #[test]
+    fn parser_upgrade_replaces_stale_local_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let sync = directory.path().join("sync");
+        fs::create_dir(&sync).unwrap();
+        let cache_path = directory.path().join("cache.sqlite");
+        let cache = TokenEventCache::open_or_create(&cache_path).unwrap();
+        let writer = store(&sync, "mac-a").with_cache(&cache);
+        let mut old = event("mac-a", "same", 1, "/local/a.jsonl");
+        old.model = "Unknown".into();
+        writer.synchronize(&[old], true, None, || false);
+        assert!(!writer.local_ledger_needs_full_export(|| false).unwrap());
+
+        rusqlite::Connection::open(&cache_path)
+            .unwrap()
+            .execute(
+                "UPDATE origin_files SET parser_version = ?1 WHERE origin_kind = 'sync_ledger'",
+                [CACHE_PARSER_VERSION - 1],
+            )
+            .unwrap();
+        assert!(writer.local_ledger_needs_full_export(|| false).unwrap());
+
+        writer.synchronize(
+            &[event("mac-a", "same", 1, "/local/a.jsonl")],
+            true,
+            None,
+            || false,
+        );
+        let records = read_ledger(&writer.local_ledger_path(), None)
+            .unwrap()
+            .records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model, "gpt-5.5");
+        assert!(!writer.local_ledger_needs_full_export(|| false).unwrap());
     }
 
     #[test]
