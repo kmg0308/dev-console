@@ -1,5 +1,8 @@
 use std::path::Path;
-use std::{collections::HashSet, fs};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{
@@ -418,23 +421,17 @@ impl TokenEventCache {
     ) -> Result<(), CacheError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
-        let existing_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM event_records WHERE origin_kind = ?1 AND origin_path = ?2",
-            params![origin_kind.as_str(), snapshot.path],
-            |row| row.get(0),
-        )?;
         transaction.execute(
             "DELETE FROM origin_files WHERE origin_kind = ?1 AND origin_path = ?2",
             params![origin_kind.as_str(), snapshot.path],
         )?;
-        insert_origin(
-            &transaction,
-            origin_kind,
-            snapshot,
-            false,
-            existing_count.saturating_add(events.len() as i64),
-        )?;
         insert_events(&transaction, origin_kind, &snapshot.path, events)?;
+        let event_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM event_records WHERE origin_kind = ?1 AND origin_path = ?2",
+            params![origin_kind.as_str(), snapshot.path],
+            |row| row.get(0),
+        )?;
+        insert_origin(&transaction, origin_kind, snapshot, false, event_count)?;
         transaction.commit()?;
         Ok(())
     }
@@ -574,6 +571,93 @@ impl TokenEventCache {
             return Ok(());
         }
         self.remove_origins(OriginKind::LocalLog, paths.iter().map(String::as_str))
+    }
+
+    pub fn remove_moved_codex_overlap(
+        &self,
+        old_path: &str,
+        archive_path: &str,
+    ) -> Result<usize, CacheError> {
+        let old = self.events_for_origin(OriginKind::LocalLog, old_path)?;
+        let archived = self.events_for_origin(OriginKind::LocalLog, archive_path)?;
+        if old.is_empty() || archived.is_empty() {
+            return Ok(0);
+        }
+        let usage = |record: &CachedEventRecord| {
+            serde_json::from_slice::<TokenEvent>(&record.event_json)
+                .ok()
+                .map(|event| event.usage)
+        };
+        let mut exact = HashMap::<(u64, TokenUsage), Vec<usize>>::new();
+        for (index, record) in old.iter().enumerate() {
+            if let Some(usage) = usage(record) {
+                exact
+                    .entry((record.timestamp.to_bits(), usage))
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut matched = HashSet::new();
+        let mut unmatched_archive = Vec::new();
+        for record in &archived {
+            let Some(archive_usage) = usage(record) else {
+                continue;
+            };
+            let matched_exact = exact
+                .get_mut(&(record.timestamp.to_bits(), archive_usage))
+                .and_then(Vec::pop);
+            if let Some(index) = matched_exact {
+                matched.insert(index);
+            } else {
+                unmatched_archive.push(record);
+            }
+        }
+        let mut old_by_time = HashMap::<u64, Vec<usize>>::new();
+        for (index, record) in old.iter().enumerate() {
+            if !matched.contains(&index) && usage(record).is_some() {
+                old_by_time
+                    .entry(record.timestamp.to_bits())
+                    .or_default()
+                    .push(index);
+            }
+        }
+        let mut archive_by_time = HashMap::<u64, usize>::new();
+        for record in unmatched_archive {
+            *archive_by_time
+                .entry(record.timestamp.to_bits())
+                .or_default() += 1;
+        }
+        for (timestamp, indexes) in old_by_time {
+            if indexes.len() == 1 && archive_by_time.get(&timestamp) == Some(&1) {
+                matched.insert(indexes[0]);
+            }
+        }
+        if matched.is_empty() {
+            return Ok(0);
+        }
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        for index in &matched {
+            let record = &old[*index];
+            transaction.execute(
+                "DELETE FROM event_records WHERE origin_kind = 'local_log' AND origin_path = ?1 AND device_id = ?2 AND event_id = ?3",
+                params![old_path, record.device_id, record.event_id],
+            )?;
+        }
+        let remaining = old.len() - matched.len();
+        if remaining == 0 {
+            transaction.execute(
+                "DELETE FROM origin_files WHERE origin_kind = 'local_log' AND origin_path = ?1",
+                [old_path],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE origin_files SET event_count = ?2 WHERE origin_kind = 'local_log' AND origin_path = ?1",
+                params![old_path, remaining as i64],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(matched.len())
     }
 
     pub fn events(

@@ -155,6 +155,65 @@ impl<'a> TokenLogScanner<'a> {
             return ScanResult::default();
         }
         fresh_events.extend(hermes.events.iter().cloned());
+        if enumeration_completed
+            && let (Some(cache), Some(sessions_root)) =
+                (self.cache, self.roots.codex_sessions.as_deref())
+        {
+            let sessions_root = canonical_or_owned(sessions_root);
+            let archived = roots
+                .iter()
+                .filter(|root| {
+                    root.root.source == TokenSource::Codex
+                        && root.root.path.as_ref() == self.roots.codex_archive.as_ref()
+                })
+                .flat_map(|root| &root.files)
+                .filter(|file| {
+                    cache
+                        .has_current_local_events(&file.snapshot)
+                        .unwrap_or(false)
+                })
+                .filter_map(|file| {
+                    file.path
+                        .file_name()
+                        .map(|name| (name.to_os_string(), file.snapshot.path.clone()))
+                })
+                .collect::<HashMap<_, _>>();
+            if !archived.is_empty() {
+                let moved = cache
+                    .local_log_origins(None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(path, source)| {
+                        let old = Path::new(&path);
+                        if source != TokenSource::Codex
+                            || !old.starts_with(&sessions_root)
+                            || old.exists()
+                        {
+                            return None;
+                        }
+                        archived
+                            .get(old.file_name()?)
+                            .map(|archive| (path, archive.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                let mut overlap_errors = 0;
+                for (old, archive) in moved {
+                    if is_cancelled() {
+                        return ScanResult::default();
+                    }
+                    if cache.remove_moved_codex_overlap(&old, &archive).is_err() {
+                        overlap_errors += 1;
+                    }
+                }
+                if overlap_errors > 0
+                    && let Some(root) = roots
+                        .iter_mut()
+                        .find(|root| root.root.path.as_ref() == self.roots.codex_archive.as_ref())
+                {
+                    root.parse_error_count += overlap_errors;
+                }
+            }
+        }
         let cached_events = self
             .cache
             .and_then(|cache| cache.events(event_after).ok())
@@ -314,14 +373,9 @@ impl<'a> TokenLogScanner<'a> {
         if is_cancelled() {
             return Some(Ok(cached_events));
         }
-        let existing = cached_events
-            .iter()
-            .map(|event| (event.device_id.clone(), event.id.clone()))
-            .collect::<HashSet<_>>();
         let new_events = new_events
             .into_iter()
             .map(|event| event.with_device(&self.local_device))
-            .filter(|event| !existing.contains(&(event.device_id.clone(), event.id.clone())))
             .collect::<Vec<_>>();
         if cache
             .append_local_events(&file.snapshot, &new_events)
@@ -329,7 +383,9 @@ impl<'a> TokenLogScanner<'a> {
         {
             return None;
         }
-        Some(Ok(cached_events.into_iter().chain(new_events).collect()))
+        Some(Ok(deduplicated(
+            cached_events.into_iter().chain(new_events),
+        )))
     }
 
     fn parse(
@@ -660,6 +716,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::cache::OriginKind;
 
     fn roots(base: &Path) -> ScannerRoots {
         ScannerRoots::new(
@@ -759,8 +816,20 @@ mod tests {
                 .iter()
                 .map(|event| event.usage.total)
                 .sum::<i64>(),
-            35
+            115
         );
+        assert_eq!(
+            cache
+                .origin_file(
+                    OriginKind::LocalLog,
+                    &path.canonicalize().unwrap().to_string_lossy()
+                )
+                .unwrap()
+                .unwrap()
+                .event_count,
+            2
+        );
+        assert_eq!(scanner.cached_result(None).unwrap().events.len(), 2);
     }
 
     #[test]
@@ -814,6 +883,100 @@ mod tests {
         let result = scanner.scan(None, None, || false);
         assert_eq!(result.events.len(), 1);
         assert_eq!(result.events[0].source, TokenSource::Codex);
+    }
+
+    #[test]
+    fn copied_then_archived_codex_session_counts_once() {
+        let directory = tempdir().unwrap();
+        let roots = roots(directory.path());
+        let session = configured(&roots.codex_sessions).join("rollout.jsonl");
+        let archive = configured(&roots.codex_archive).join("rollout.jsonl");
+        write_codex(&session, 10);
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        let cache =
+            TokenEventCache::open_or_create(&directory.path().join("cache.sqlite")).unwrap();
+        let scanner =
+            TokenLogScanner::new(roots, TokenDeviceMetadata::local_fallback(), Some(&cache));
+        assert_eq!(scanner.scan(None, None, || false).events.len(), 1);
+
+        fs::copy(&session, &archive).unwrap();
+        assert_eq!(scanner.scan(None, None, || false).events.len(), 1);
+        let cached_session = session.canonicalize().unwrap();
+        let origin = cache
+            .origin_file(OriginKind::LocalLog, &cached_session.to_string_lossy())
+            .unwrap()
+            .unwrap();
+        let mut legacy = parse_codex_file(&session, 0, || false).unwrap().remove(0);
+        legacy.id = "legacy-path-id".into();
+        legacy.usage = crate::models::TokenUsage::new(11, 0, 0, 0, 0, 0, None);
+        cache
+            .replace_local_events(
+                &FileSnapshot {
+                    path: cached_session.to_string_lossy().into_owned(),
+                    source: Some(TokenSource::Codex),
+                    size: origin.file_size,
+                    modified_at: origin.modified_at,
+                    device_id: origin.device_id,
+                },
+                &[legacy],
+                false,
+            )
+            .unwrap();
+        fs::remove_file(&session).unwrap();
+        let result = scanner.scan(None, None, || false);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].usage.total, 10);
+        assert!(
+            cache
+                .origin_file(OriginKind::LocalLog, &cached_session.to_string_lossy())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cache.events(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn shorter_archive_preserves_usage_only_in_the_missing_session() {
+        let directory = tempdir().unwrap();
+        let roots = roots(directory.path());
+        let session = configured(&roots.codex_sessions).join("rollout.jsonl");
+        let archive = configured(&roots.codex_archive).join("rollout.jsonl");
+        write_codex(&session, 10);
+        let first_line = fs::read_to_string(&session).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&session)
+            .unwrap()
+            .write_all(b"{\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{\"info\":{\"total_token_usage\":{\"input_tokens\":20,\"total_tokens\":20},\"last_token_usage\":{\"input_tokens\":10,\"total_tokens\":10}}}}\n")
+            .unwrap();
+        let cached_session = session.canonicalize().unwrap();
+        let cache =
+            TokenEventCache::open_or_create(&directory.path().join("cache.sqlite")).unwrap();
+        let scanner =
+            TokenLogScanner::new(roots, TokenDeviceMetadata::local_fallback(), Some(&cache));
+        assert_eq!(scanner.scan(None, None, || false).events.len(), 2);
+
+        fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        fs::write(&archive, first_line).unwrap();
+        fs::remove_file(&session).unwrap();
+        let result = scanner.scan(None, None, || false);
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .map(|event| event.usage.total)
+                .sum::<i64>(),
+            20
+        );
+        assert_eq!(
+            cache
+                .origin_file(OriginKind::LocalLog, &cached_session.to_string_lossy())
+                .unwrap()
+                .unwrap()
+                .event_count,
+            1
+        );
     }
 
     #[test]
