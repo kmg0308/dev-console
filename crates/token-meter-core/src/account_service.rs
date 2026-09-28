@@ -31,6 +31,8 @@ const READ_RATE_LIMITS: &[u8] =
 const MAX_LINE_BYTES: u64 = 1024 * 1024;
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_EXIT_GRACE: Duration = Duration::from_millis(100);
+#[cfg(target_os = "macos")]
+const CHATGPT_CODEX_CLI: &str = "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CodexAccountUsageServiceError {
@@ -53,12 +55,23 @@ pub fn fetch_codex_account_usage(
     timeout: Duration,
 ) -> Result<CodexAccountUsage, CodexAccountUsageServiceError> {
     let executable = account_executable(configured_executable)?;
-    let mut command = Command::new(executable);
+    let mut command = Command::new(&executable);
     command
         .args(["app-server", "--stdio"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(target_os = "macos")]
+    if let Some(directory) = executable.parent() {
+        // GUI apps lack the shell PATH that npm Codex wrappers use to find node.
+        let existing = env::var_os("PATH").unwrap_or_default();
+        if let Ok(path) = env::join_paths(
+            std::iter::once(directory.to_path_buf())
+                .chain(env::split_paths(&existing).filter(|path| !path.as_os_str().is_empty())),
+        ) {
+            command.env("PATH", path);
+        }
+    }
 
     let tree = ProcessTree::prepare(&mut command)
         .map_err(|_| CodexAccountUsageServiceError::LaunchFailed)?;
@@ -126,6 +139,7 @@ fn resolve_macos_account_executable() -> Result<PathBuf, CodexAccountUsageServic
     let home = env::var_os("HOME").map(PathBuf::from);
     let path = env::var_os("PATH");
     let system_candidates = [
+        PathBuf::from("/Applications/ChatGPT.app").join(CHATGPT_CODEX_CLI),
         PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
         PathBuf::from("/Applications/Codex.app/Contents/Resources/codex"),
         PathBuf::from("/opt/homebrew/bin/codex"),
@@ -145,6 +159,10 @@ fn resolve_macos_account_executable_from(
     let mut candidates = Vec::new();
     if let Some(home) = home {
         candidates.push(home.join(".local/bin/codex"));
+        candidates.push(
+            home.join("Applications/ChatGPT.app")
+                .join(CHATGPT_CODEX_CLI),
+        );
         candidates.push(home.join("Applications/ChatGPT.app/Contents/Resources/codex"));
     }
     candidates.extend_from_slice(system_candidates);
@@ -634,7 +652,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let home = directory.path().join("home");
         let local = home.join(".local/bin/codex");
-        let app = home.join("Applications/ChatGPT.app/Contents/Resources/codex");
+        let app = home
+            .join("Applications/ChatGPT.app")
+            .join(CHATGPT_CODEX_CLI);
         let system = directory.path().join("system/codex");
         let path = directory.path().join("path/codex");
         for candidate in [&local, &app, &system, &path] {
@@ -691,6 +711,29 @@ mod tests {
         for _ in 0..20 {
             let usage =
                 fetch_codex_account_usage(Some(success.as_os_str()), Duration::from_secs(2))
+                    .unwrap();
+            assert_eq!(usage.five_hour_window.unwrap().used_percent, 31);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let wrapper = fixture.path().join("codex");
+            let node = fixture.path().join("node");
+            fs::write(&wrapper, b"#!/usr/bin/env node\n").unwrap();
+            fs::write(
+                &node,
+                b"#!/bin/sh\nexec \"${0%/*}/success\" app-server --stdio\n",
+            )
+            .unwrap();
+            for path in [&wrapper, &node] {
+                let mut permissions = fs::metadata(path).unwrap().permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(path, permissions).unwrap();
+            }
+            let usage =
+                fetch_codex_account_usage(Some(wrapper.as_os_str()), Duration::from_secs(2))
                     .unwrap();
             assert_eq!(usage.five_hour_window.unwrap().used_percent, 31);
         }
