@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::STATUS_SCHEMA_VERSION;
+use crate::databases::{DatabaseStatus, database_statuses};
 use std::path::Path;
 
 use crate::models::{
@@ -16,7 +17,7 @@ use crate::relations::{
 };
 use crate::repository::inspect_repositories;
 use crate::sessions::reconcile_action_sessions;
-use crate::storage::RuntimeAtlasPaths;
+use crate::storage::{DatabaseBindingStore, RuntimeAtlasPaths};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RepositorySnapshotInput {
@@ -78,6 +79,8 @@ pub struct RuntimeAtlasSnapshot {
     pub processes: Vec<ObservedProcess>,
     pub relations: Vec<ProcessRelation>,
     pub containers: Vec<RelatedContainer>,
+    #[serde(default)]
+    pub databases: Vec<DatabaseStatus>,
     pub actions: Vec<CustomActionDefinition>,
     pub action_runs: Vec<ActionRun>,
 }
@@ -137,7 +140,7 @@ pub fn build_observed_snapshot(
         })
         .collect();
 
-    Ok(build_snapshot(RuntimeAtlasSnapshotInput {
+    let mut snapshot = build_snapshot(RuntimeAtlasSnapshotInput {
         generated_at: Utc::now(),
         language: configuration.app_language.unwrap_or(default_language),
         process_discovery: process_observation.availability,
@@ -150,7 +153,30 @@ pub fn build_observed_snapshot(
         containers: docker_observation.containers,
         actions: configuration.custom_actions,
         action_runs: sessions.action_runs,
-    }))
+    });
+    attach_database_statuses(&mut snapshot, paths);
+    Ok(snapshot)
+}
+
+pub fn attach_database_statuses(snapshot: &mut RuntimeAtlasSnapshot, paths: &RuntimeAtlasPaths) {
+    let containers = snapshot
+        .containers
+        .iter()
+        .map(|entry| entry.container.clone())
+        .collect::<Vec<_>>();
+    match DatabaseBindingStore::new(paths).with_records(|records| {
+        database_statuses(
+            records,
+            &containers,
+            snapshot.docker_discovery.state == crate::models::AvailabilityState::Available,
+        )
+    }) {
+        Ok(statuses) => snapshot.databases = statuses,
+        Err(error) => snapshot.notices.push(AtlasNotice {
+            kind: AtlasNoticeKind::Warning,
+            message: error.to_string(),
+        }),
+    }
 }
 
 /// Composes caller-verified observations without performing filesystem or process discovery.
@@ -192,6 +218,7 @@ pub fn build_snapshot(input: RuntimeAtlasSnapshotInput) -> RuntimeAtlasSnapshot 
         processes: graph.processes,
         relations: graph.process_relations,
         containers,
+        databases: Vec::new(),
         actions: input.actions,
         action_runs: input.action_runs,
     };
@@ -336,6 +363,7 @@ mod tests {
                 worktree_path: nested.to_owned(),
             }],
             containers: vec![RuntimeContainer {
+                running: true,
                 id: "container-1".to_owned(),
                 name: "web".to_owned(),
                 image: "web:latest".to_owned(),

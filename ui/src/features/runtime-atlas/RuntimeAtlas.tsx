@@ -508,6 +508,7 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
   });
   const containers = snapshot.containers.filter((container) =>
     container.worktreeLinks.some((link) => link.worktreePath === worktree.path));
+  const databases = snapshot.databases.filter((database) => database.worktreePath === worktree.path);
   const repositoryActions = actionsForScope(snapshot.actions, repository.id, "repositoryRoot");
   const worktreeActions = actionsForScope(snapshot.actions, repository.id, "selectedWorktree");
   const repositoryWorktree = repositoryExecutionWorktree(repository);
@@ -555,20 +556,21 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
             <RuntimeRow icon={<Terminal />} title={text("포트를 열고 기다리는 프로세스 없음", "No process opening a port")} detail={text("이 작업 폴더에서 실행되고(cwd) 포트를 열어 둔(LISTEN) 프로세스가 없습니다.", "No process with an open LISTEN port is running from this working folder (cwd).") } />
           )}
           {processes.map(({ process, relation }) => (
-            <ProcessRow key={`${process.identity.pid}-${process.identity.startIdentity}`} process={process} relation={relation} worktree={worktree} korean={korean} busy={busy} mutate={mutate} />
+            <ProcessRow key={`${process.identity.pid}-${process.identity.startIdentity}`} process={process} relation={relation} worktree={worktree} korean={korean} busy={busy} mutate={mutate} message={setMessage} />
           ))}
           {snapshot.dockerDiscovery.state === "unavailable" && <RuntimeRow icon={<Warning weight="fill" />} title={text("Docker 사용 불가", "Docker unavailable")} detail={snapshot.dockerDiscovery.reason || text("Docker 정보를 읽지 못했습니다.", "Docker could not be read.")} tone="warning" />}
-          {snapshot.dockerDiscovery.state === "available" && containers.length === 0 && (
+          {snapshot.dockerDiscovery.state === "available" && containers.length === 0 && databases.length === 0 && (
             <RuntimeRow icon={<Cube />} title={text("연결된 Docker 컨테이너 없음", "No linked Docker container")} detail={text("이 폴더를 마운트했거나 저장소가 명시적으로 등록한 실행 컨테이너가 없습니다.", "No running container mounts this folder or was explicitly registered by the repository.")} />
           )}
+          {databases.map((database) => <RuntimeRow key={`${database.containerName}:${database.label}`} icon={<Cube weight="fill" />} title={`${database.containerName} · ${database.state === "running" ? text("DB 실행 중", "DB running") : database.state === "stopped" ? text("DB 중지됨", "DB stopped") : database.state === "missing" ? text("컨테이너 없음", "Container missing") : text("DB 확인 불가", "DB unavailable")}`} detail={`${database.label} · ${text("서버와 별도 상태 · 데이터와 볼륨 보존", "Separate from server status · Data and volumes preserved")}`} tone={database.state === "running" ? "accent" : database.state === "unavailable" ? "warning" : "muted"} />)}
           {containers.map((container) => (
             <RuntimeRow
               key={container.id}
               icon={<Cube weight="fill" />}
-              title={container.name}
+              title={`${container.name} · ${container.running ? text("실행 중", "Running") : text("중지됨", "Stopped")}`}
               detail={`${container.image} · ${container.worktreeLinks.filter((link) => link.worktreePath === worktree.path).map((link) => link.mountSource).join(", ")}`}
               badges={container.ports.map((port) => `${port.hostIP || "*"}:${port.hostPort} → ${port.containerPort}/${port.transport}`)}
-              tone="accent"
+              tone={container.running ? "accent" : "muted"}
             />
           ))}
         </div>
@@ -577,22 +579,23 @@ function WorktreeDetail({ repository, worktree, snapshot, korean, busy, error, c
   );
 }
 
-function ProcessRow({ process, relation, worktree, korean, busy, mutate }: {
+function ProcessRow({ process, relation, worktree, korean, busy, mutate, message }: {
   process: RuntimeProcess;
   relation: Exclude<ProcessRelation, { kind: "unlinked" }>;
   worktree: Worktree;
   korean: boolean;
   busy: boolean;
   mutate: (operation: () => Promise<unknown>) => Promise<boolean>;
+  message: (value: string) => void;
 }) {
   const text = (ko: string, en: string) => korean ? ko : en;
   const stop = () => {
     const ports = process.ports.map((port) => `${port.address}:${port.port}`).join(", ");
     const warning = text(
-      `${process.name} (PID ${process.identity.pid}, ${ports}) 프로세스를 중지할까요? 백엔드는 종료 직전에 PID와 프로세스 시작 identity를 다시 검증합니다. identity가 다르면 중지하지 않습니다.`,
-      `Stop ${process.name} (PID ${process.identity.pid}, ${ports})? The backend re-validates the PID and process start identity immediately before termination. It will not stop a different process.`,
+      `${process.name} (PID ${process.identity.pid}, ${ports})의 실행과 하위 프로세스를 중지할까요? 공유 DB는 다른 사용자가 없음을 확인한 경우에만 중지하며 데이터와 볼륨은 보존합니다.`,
+      `Stop the run and descendants of ${process.name} (PID ${process.identity.pid}, ${ports})? A shared DB stops only after verifying it has no other users. Data and volumes are preserved.`,
     );
-    if (window.confirm(warning)) void mutate(() => runtimeAtlasCommands.stopProcess(process.identity, worktree.path));
+    if (window.confirm(warning)) void mutate(async () => message(await runtimeAtlasCommands.stopProcess(process.identity, worktree.path)));
   };
   return (
     <RuntimeRow
@@ -604,7 +607,7 @@ function ProcessRow({ process, relation, worktree, korean, busy, mutate }: {
       actions={<>
         {relation.kind === "userLinked" && <button type="button" disabled={busy} onClick={() => void mutate(() => runtimeAtlasCommands.unlinkProcess(process.identity))}>{text("연결 해제", "Unlink")}</button>}
         {process.cwd
-          ? <button type="button" className="danger-text" disabled={busy} onClick={stop}>{text("포트 닫기", "Close ports")}</button>
+          ? <button type="button" className="danger-text" disabled={busy} onClick={stop}>{text("실행 중지", "Stop run")}</button>
           : <span title={text("검증된 cwd가 없어 안전하게 중지할 수 없습니다.", "A verified cwd is required for safe termination.")}>{text("중지 불가", "Stop unavailable")}</span>}
       </>}
     />
@@ -672,7 +675,7 @@ function ActionRow({ action, run, executionWorktree, executionPath = executionWo
   const status = run ? (run.managed ? run.phase : text("외부 실행 중", "External · Running")) : undefined;
   return (
     <article className="atlas-action-row">
-      <button type="button" className={`atlas-command-button${externalRunning ? " external-running" : ""}`} disabled={busy || planning || executionWorktree.availability !== "available"} onClick={() => externalRunning ? message(text("이 작업 폴더에서 이미 포트를 연 프로세스가 있습니다. 새로 실행하려면 실행 상태에서 해당 포트를 먼저 닫으세요.", "A listener is already running from this working folder. Close it in Runtime Status before starting another one.")) : active ? void mutate(() => runtimeAtlasCommands.stopAction(action.id, executionWorktree.path)) : openExecution(false)}>
+      <button type="button" className={`atlas-command-button${externalRunning ? " external-running" : ""}`} disabled={busy || planning || executionWorktree.availability !== "available"} onClick={() => externalRunning ? message(text("이 작업 폴더에서 이미 포트를 연 프로세스가 있습니다. 새로 실행하려면 실행 상태에서 해당 포트를 먼저 닫으세요.", "A listener is already running from this working folder. Close it in Runtime Status before starting another one.")) : active ? void mutate(async () => message(await runtimeAtlasCommands.stopAction(action.id, executionWorktree.path))) : openExecution(false)}>
         {externalRunning ? <Broadcast weight="bold" /> : active ? <Stop weight="fill" /> : action.kind === "session" ? <Play weight="fill" /> : <Terminal weight="fill" />}
         <strong>{action.name}</strong>
         {status && run && <span className={run.phase}>{status}{run.exitCode !== null ? ` (${run.exitCode})` : ""}</span>}

@@ -37,6 +37,69 @@ pub fn observe_process_ancestry(process: &ProcessIdentity) -> Option<Vec<Process
     platform::observe_process_ancestry(process)
 }
 
+/// Includes detached process groups; identities are captured before sending any signal.
+pub fn observe_process_tree(root: &ProcessIdentity) -> Option<Vec<ProcessIdentity>> {
+    platform::observe_process_tree(root)
+}
+
+#[cfg(target_os = "macos")]
+pub fn verify_worktrees_idle(worktrees: &[&Path]) -> Result<(), String> {
+    let mut command = Command::new("/usr/sbin/lsof");
+    command.args(["-d", "cwd", "-Fpn"]);
+    let output =
+        command_output(&mut command).map_err(|_| "작업 폴더의 실행 여부를 확인할 수 없습니다.")?;
+    let text = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "작업 프로세스 정보를 해석할 수 없습니다.")?;
+    let parsed = crate::runtime::parse_lsof_working_directories(text);
+    if !output.status.success() || parsed.state != crate::runtime::LsofParseState::Complete {
+        return Err("작업 프로세스 조회가 불완전합니다.".to_owned());
+    }
+    // ponytail: a shell/editor may be idle but still start DB work; retain until its cwd is closed.
+    if parsed.directories.values().any(|cwd| {
+        worktrees
+            .iter()
+            .any(|worktree| Path::new(cwd).starts_with(worktree))
+    }) {
+        return Err("작업 폴더에 남은 프로세스의 DB 사용 여부를 확인할 수 없습니다.".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn verify_worktrees_idle(_worktrees: &[&Path]) -> Result<(), String> {
+    Err("포트를 열지 않은 작업의 DB 사용 여부를 확인할 수 없습니다.".to_owned())
+}
+
+fn verified_tree(
+    root: &ProcessIdentity,
+    parents: &std::collections::BTreeMap<u32, u32>,
+    mut fact: impl FnMut(u32) -> Option<ProcessFact>,
+) -> Option<Vec<ProcessIdentity>> {
+    let root_fact = fact(root.pid)?;
+    if root_fact.identity != *root {
+        return None;
+    }
+    let mut tree = vec![root_fact];
+    let mut index = 0;
+    while index < tree.len() {
+        for (&pid, &parent_pid) in parents {
+            if parent_pid == tree[index].identity.pid {
+                let child = fact(pid)?;
+                if child.parent_pid != parent_pid
+                    || child.started_at < tree[index].started_at
+                    || tree.iter().any(|entry| entry.identity.pid == pid)
+                {
+                    return None;
+                }
+                tree.push(child);
+            }
+        }
+        index += 1;
+    }
+    (fact(root.pid)?.identity == *root)
+        .then(|| tree.into_iter().map(|entry| entry.identity).collect())
+}
+
 pub fn resolve_docker_executable() -> Option<PathBuf> {
     resolve_executable_in_path(
         std::env::var_os("PATH").as_deref(),
@@ -76,9 +139,17 @@ fn is_regular_executable(path: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 fn docker_from_registered_bundles(bundles: &[PathBuf]) -> Option<PathBuf> {
-    let [bundle] = bundles else {
-        return None;
-    };
+    let executables: std::collections::BTreeSet<_> = bundles
+        .iter()
+        .filter_map(|bundle| docker_from_bundle(bundle))
+        .collect();
+    (executables.len() == 1)
+        .then(|| executables.into_iter().next())
+        .flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn docker_from_bundle(bundle: &Path) -> Option<PathBuf> {
     let bundle = fs::canonicalize(bundle).ok()?;
     if !fs::symlink_metadata(&bundle).ok()?.file_type().is_dir() {
         return None;
@@ -204,6 +275,23 @@ mod docker_resolver_tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_worktree_job_without_a_listener_keeps_the_database() {
+        let temporary = tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .current_dir(&root)
+            .spawn()
+            .unwrap();
+        let result = verify_worktrees_idle(&[&root]);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(result.is_err());
+        assert!(verify_worktrees_idle(&[&root]).is_ok());
+    }
+
     fn make_executable(path: &Path) {
         fs::write(path, b"fixture").unwrap();
         #[cfg(unix)]
@@ -257,7 +345,20 @@ mod docker_resolver_tests {
             Some(fs::canonicalize(executable).unwrap())
         );
         assert_eq!(
-            docker_from_registered_bundles(&[bundle.clone(), bundle]),
+            docker_from_registered_bundles(&[
+                bundle.clone(),
+                temporary.path().join("missing/Docker.app"),
+                bundle.clone()
+            ]),
+            docker_from_bundle(&bundle)
+        );
+        let other = temporary
+            .path()
+            .join("Other.app/Contents/Resources/bin/docker");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        make_executable(&other);
+        assert_eq!(
+            docker_from_registered_bundles(&[bundle, temporary.path().join("Other.app")]),
             None
         );
 
@@ -335,7 +436,7 @@ pub fn observe_docker(executable: Option<&Path>) -> DockerObservation {
     }
 
     let mut list = Command::new(executable);
-    list.args(["ps", "--quiet", "--no-trunc"]);
+    list.args(["ps", "--all", "--quiet", "--no-trunc"]);
     let listing = match command_output(&mut list) {
         Ok(output) if output.status.success() => output,
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
@@ -393,6 +494,7 @@ pub fn observe_docker(executable: Option<&Path>) -> DockerObservation {
                 id: container.id,
                 name: container.name,
                 image: container.image,
+                running: container.running,
                 mount_sources: container.mount_sources,
                 ports: container.ports,
             })
@@ -440,6 +542,24 @@ mod platform {
     use super::{ProcessObservation, unavailable, warning};
 
     const LSOF: &str = "/usr/sbin/lsof";
+
+    pub(super) fn observe_process_tree(root: &ProcessIdentity) -> Option<Vec<ProcessIdentity>> {
+        let mut command = Command::new("/bin/ps");
+        command.args(["-axo", "pid=,ppid="]);
+        let output = command_output(&mut command).ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let parents = std::str::from_utf8(&output.stdout)
+            .ok()?
+            .lines()
+            .map(|line| {
+                let mut columns = line.split_whitespace();
+                Some((columns.next()?.parse().ok()?, columns.next()?.parse().ok()?))
+            })
+            .collect::<Option<BTreeMap<u32, u32>>>()?;
+        super::verified_tree(root, &parents, process_fact)
+    }
 
     pub(super) fn observe_processes() -> ProcessObservation {
         let mut command = Command::new(LSOF);
@@ -814,6 +934,17 @@ mod platform {
         })
     }
 
+    pub(super) fn observe_process_tree(root: &ProcessIdentity) -> Option<Vec<ProcessIdentity>> {
+        let processes = toolhelp_processes()?;
+        let parents = processes
+            .iter()
+            .map(|(&pid, entry)| (pid, entry.parent_pid))
+            .collect();
+        super::verified_tree(root, &parents, |pid| {
+            process_fact(pid, processes.get(&pid)?.parent_pid)
+        })
+    }
+
     fn read_ipv4(processes: &mut BTreeMap<u32, Vec<ListeningPort>>) -> bool {
         let Some(bytes) = tcp_table(AF_INET as u32) else {
             return false;
@@ -1082,6 +1213,10 @@ mod platform {
     pub(super) fn observe_process_ancestry(
         _process: &ProcessIdentity,
     ) -> Option<Vec<ProcessIdentity>> {
+        None
+    }
+
+    pub(super) fn observe_process_tree(_root: &ProcessIdentity) -> Option<Vec<ProcessIdentity>> {
         None
     }
 }

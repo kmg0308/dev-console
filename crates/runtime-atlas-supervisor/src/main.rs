@@ -841,7 +841,8 @@ mod platform {
             let first = !TERMINATION_REQUESTED.swap(true, Ordering::AcqRel);
             unsafe { libc::kill(-group, signal) };
             if first && (signal == libc::SIGTERM || signal == libc::SIGINT) {
-                unsafe { libc::alarm(2) };
+                // Repository runners need time to drain detached services before releasing DB ownership.
+                unsafe { libc::alarm(10) };
             }
         }
     }

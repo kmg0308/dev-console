@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use runtime_atlas_core::databases::DatabaseBinding;
 use runtime_atlas_core::models::{
     AppLanguage, AtlasNotice, CustomActionDefinition, DiscoveryAvailability, RepositoryStatus,
     RuntimeContainer, RuntimeProcess,
@@ -10,10 +11,13 @@ use runtime_atlas_core::relations::PathFlavor;
 use runtime_atlas_core::service::{
     ObservedSnapshotInput, RuntimeAtlasSnapshot, build_observed_snapshot,
 };
-use runtime_atlas_core::storage::{ConfigurationStore, RuntimeAtlasPaths};
+use runtime_atlas_core::sessions::process_identity;
+use runtime_atlas_core::storage::{
+    ConfigurationStore, DatabaseBindingStore, RuntimeAtlasPaths, canonical_path,
+};
 use serde::Serialize;
 
-const USAGE: &str = "Runtime Atlas reads local worktree and runtime state.\n\nUsage:\n  runtime-atlas status --json\n  runtime-atlas actions --json\n";
+const USAGE: &str = "Runtime Atlas reads local worktree and runtime state.\n\nUsage:\n  runtime-atlas status --json\n  runtime-atlas actions --json\n  runtime-atlas link database --label <name> --worktree <path> --container <name> --owner-pid <pid>\n  runtime-atlas unlink database --worktree <path> [--owner-pid <pid>]\n";
 
 fn main() {
     let mut stdout = io::stdout().lock();
@@ -34,6 +38,11 @@ fn run(
 ) -> i32 {
     let arguments = arguments.into_iter().collect::<Vec<_>>();
     match arguments.as_slice() {
+        [command, kind, options @ ..]
+            if matches!(command.as_str(), "link" | "unlink") && kind == "database" =>
+        {
+            database_binding_command(command == "link", options, data_directory, stdout, stderr)
+        }
         [command] if matches!(command.as_str(), "help" | "--help" | "-h") => {
             write(stdout, USAGE, 0)
         }
@@ -55,6 +64,93 @@ fn run(
             &format!("Unknown command: {command}\n\n{USAGE}"),
             64,
         ),
+    }
+}
+
+fn database_binding_command(
+    link: bool,
+    options: &[String],
+    directory: Option<PathBuf>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    let result = (|| -> Result<(), String> {
+        let mut values = std::collections::BTreeMap::new();
+        if !options.len().is_multiple_of(2) {
+            return Err("Database binding options require values.".to_owned());
+        }
+        for pair in options.chunks_exact(2) {
+            if !matches!(
+                pair[0].as_str(),
+                "--label" | "--worktree" | "--container" | "--owner-pid"
+            ) || values.insert(pair[0].as_str(), pair[1].as_str()).is_some()
+            {
+                return Err("Invalid or duplicate database binding option.".to_owned());
+            }
+        }
+        let path = Path::new(*values.get("--worktree").ok_or("A worktree is required.")?);
+        if !path.is_absolute() || !path.is_dir() {
+            return Err("An existing absolute worktree is required.".to_owned());
+        }
+        let worktree = canonical_path(path);
+        let owner = values
+            .get("--owner-pid")
+            .map(|value| {
+                let pid = value
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid owner PID.".to_owned())?;
+                let identity = process_identity(pid)?;
+                let caller = process_identity(std::process::id())?;
+                let ancestry = runtime_atlas_core::observe::observe_process_ancestry(&caller)
+                    .ok_or("Caller ancestry cannot be verified.")?;
+                if !ancestry.contains(&identity) {
+                    return Err("Database owner must be a verified caller ancestor.".to_owned());
+                }
+                Ok(identity)
+            })
+            .transpose()?;
+        let paths = RuntimeAtlasPaths::new(
+            resolve_data_directory(directory)
+                .map_err(|_| "Local data directory is unavailable.")?,
+        );
+        let store = DatabaseBindingStore::new(&paths);
+        if link {
+            let owner = owner.ok_or("An owner PID is required for database registration.")?;
+            let record = DatabaseBinding {
+                id: uuid::Uuid::new_v4(),
+                kind: "database".to_owned(),
+                label: values
+                    .get("--label")
+                    .ok_or("A database label is required.")?
+                    .to_string(),
+                worktree_path: worktree,
+                container_name: values
+                    .get("--container")
+                    .ok_or("A container name is required.")?
+                    .to_string(),
+                owner_pid: Some(owner.pid),
+                owner_identity: Some(owner),
+                registered_at: chrono::Utc::now(),
+            };
+            store.link(record).map_err(|error| error.to_string())?;
+        } else {
+            store
+                .unlink(&worktree, owner.as_ref())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => write(
+            stdout,
+            if link {
+                "Database linked.\n"
+            } else {
+                "Database owner released.\n"
+            },
+            0,
+        ),
+        Err(error) => write(stderr, &format!("{error}\n"), 1),
     }
 }
 
@@ -302,6 +398,7 @@ struct PublicWorktreeStatus {
     unavailable_reason: Option<String>,
     processes: Vec<RuntimeProcess>,
     containers: Vec<RuntimeContainer>,
+    databases: Vec<runtime_atlas_core::databases::DatabaseStatus>,
 }
 
 impl From<RuntimeAtlasSnapshot> for PublicStatus {
@@ -371,6 +468,12 @@ impl PublicRepositoryStatus {
                         left.name.cmp(&right.name).then(left.id.cmp(&right.id))
                     });
                     PublicWorktreeStatus {
+                        databases: snapshot
+                            .databases
+                            .iter()
+                            .filter(|database| database.worktree_path == worktree.path)
+                            .cloned()
+                            .collect(),
                         path: worktree.path.clone(),
                         branch: worktree.branch.clone(),
                         detached: worktree.detached,

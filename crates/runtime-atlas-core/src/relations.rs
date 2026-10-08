@@ -608,6 +608,7 @@ mod tests {
     #[test]
     fn docker_mount_edges_are_verified_many_to_many() {
         let containers = vec![RuntimeContainer {
+            running: true,
             id: "one".to_owned(),
             name: "web".to_owned(),
             image: "web".to_owned(),

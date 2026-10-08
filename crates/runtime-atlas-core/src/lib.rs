@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod command;
+pub mod databases;
 pub mod git;
 pub mod models;
 pub mod observe;
