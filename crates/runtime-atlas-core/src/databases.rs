@@ -1,4 +1,4 @@
-use std::{path::Path, process::Command};
+use std::{path::Path, process::Command, time::Duration};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -6,7 +6,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::{
-    command::output, models::RuntimeContainer, relations::ProcessIdentity,
+    command::{output, output_with_timeout},
+    models::RuntimeContainer,
+    relations::ProcessIdentity,
     sessions::process_identity,
 };
 
@@ -152,8 +154,17 @@ pub fn database_statuses(
     statuses
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum DatabaseStopOutcome {
+    Stopped,
+    Unconfirmed,
+}
+
 /// Only explicit PostgreSQL bindings on a local engine with persistent data can be stopped.
-pub fn stop_idle_database(executable: &Path, expected: &RuntimeContainer) -> Result<(), String> {
+pub fn stop_idle_database(
+    executable: &Path,
+    expected: &RuntimeContainer,
+) -> Result<DatabaseStopOutcome, String> {
     let mut command = Command::new(executable);
     command.args([
         "context",
@@ -196,17 +207,19 @@ pub fn stop_idle_database(executable: &Path, expected: &RuntimeContainer) -> Res
         "-1",
         &expected.id,
     ]);
-    checked_output(
-        &mut stop,
-        "DB 중지를 확인하지 못했습니다. 상태를 새로고침하세요.",
-    )?;
+    // Docker's daemon keeps the graceful stop request even if the CLI times out.
+    let _ = output_with_timeout(&mut stop, Duration::from_secs(45));
     let mut state = Command::new(executable);
     state.args(["inspect", "--format", "{{.State.Running}}", &expected.id]);
-    if checked_output(&mut state, "DB 중지 상태를 확인할 수 없습니다.")?.trim() != "false"
-    {
-        return Err("DB 컨테이너가 아직 실행 중입니다.".to_owned());
-    }
-    Ok(())
+    Ok(
+        if checked_output(&mut state, "DB 중지 상태를 확인할 수 없습니다.")
+            .is_ok_and(|value| value.trim() == "false")
+        {
+            DatabaseStopOutcome::Stopped
+        } else {
+            DatabaseStopOutcome::Unconfirmed
+        },
+    )
 }
 
 fn checked_output(command: &mut Command, failure: &str) -> Result<String, String> {
@@ -395,20 +408,60 @@ mod tests {
         let temporary = tempdir().unwrap();
         let executable = temporary.path().join("docker-fixture");
         let log = temporary.path().join("commands");
-        for (clients, query_status, stop_status, expected_ok, stops) in [
-            ("0", 0, 0, true, true),
-            ("1", 0, 0, false, false),
-            ("unknown", 0, 0, false, false),
-            ("0", 1, 0, false, false),
-            ("0", 0, 1, false, true),
+        for (clients, query_status, stop_status, running, delay, expected, stops) in [
+            (
+                "0",
+                0,
+                0,
+                "false",
+                0,
+                Some(DatabaseStopOutcome::Stopped),
+                true,
+            ),
+            ("1", 0, 0, "false", 0, None, false),
+            ("unknown", 0, 0, "false", 0, None, false),
+            ("0", 1, 0, "false", 0, None, false),
+            (
+                "0",
+                0,
+                1,
+                "true",
+                0,
+                Some(DatabaseStopOutcome::Unconfirmed),
+                true,
+            ),
+            (
+                "0",
+                0,
+                1,
+                "false",
+                0,
+                Some(DatabaseStopOutcome::Stopped),
+                true,
+            ),
+            (
+                "0",
+                0,
+                0,
+                "unknown",
+                0,
+                Some(DatabaseStopOutcome::Unconfirmed),
+                true,
+            ),
+            (
+                "0",
+                0,
+                0,
+                "false",
+                11,
+                Some(DatabaseStopOutcome::Stopped),
+                true,
+            ),
         ] {
             fs::write(&log, "").unwrap();
-            fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\ncontext) echo unix:///fixture/docker.sock;;\ninspect) if [ \"$2\" = --format ]; then echo false; else cat <<'JSON'\n{}\nJSON\nfi;;\nexec) echo '{}'; exit {};;\nstop) exit {};;\n*) exit 1;;\nesac\n", log.display(), details(), clients, query_status, stop_status)).unwrap();
+            fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\ncontext) echo unix:///fixture/docker.sock;;\ninspect) if [ \"$2\" = --format ]; then echo '{}'; else cat <<'JSON'\n{}\nJSON\nfi;;\nexec) echo '{}'; exit {};;\nstop) sleep {}; exit {};;\n*) exit 1;;\nesac\n", log.display(), running, details(), clients, query_status, delay, stop_status)).unwrap();
             fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-            assert_eq!(
-                stop_idle_database(&executable, &container()).is_ok(),
-                expected_ok
-            );
+            assert_eq!(stop_idle_database(&executable, &container()).ok(), expected);
             let commands = fs::read_to_string(&log).unwrap();
             assert_eq!(
                 commands.contains("stop --signal SIGTERM --timeout -1 verified-db"),

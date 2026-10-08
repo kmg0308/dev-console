@@ -16,7 +16,7 @@ use runtime_atlas_core::actions::{
 use runtime_atlas_core::command::output as command_output;
 #[cfg(target_os = "macos")]
 use runtime_atlas_core::command::output_with_timeout;
-use runtime_atlas_core::databases::stop_idle_database;
+use runtime_atlas_core::databases::{DatabaseStopOutcome, stop_idle_database};
 use runtime_atlas_core::models::{
     AppLanguage, AtlasNotice, AtlasNoticeKind, AvailabilityState, CustomActionDefinition,
     CustomActionKind, RepositoryStatus, WorktreeNavigationDirection, WorktreeNavigationSession,
@@ -1180,7 +1180,7 @@ impl RuntimeAtlasState {
             targets
                 .iter()
                 .map(|target| {
-                    let result = (|| -> Result<(), String> {
+                    let result = (|| -> Result<DatabaseStopOutcome, String> {
                         safety.clone()?;
                         if let Some(reason) = records
                             .iter()
@@ -1207,7 +1207,13 @@ impl RuntimeAtlasState {
                         stop_idle_database(&executable, target)
                     })();
                     match result {
-                        Ok(()) => format!("{}: DB 중지 (데이터 보존)", target.name),
+                        Ok(DatabaseStopOutcome::Stopped) => {
+                            format!("{}: DB 중지 (데이터 보존)", target.name)
+                        }
+                        Ok(DatabaseStopOutcome::Unconfirmed) => format!(
+                            "{}: DB 중지 결과 확인 불가 — 상태를 새로고침하세요.",
+                            target.name
+                        ),
                         Err(reason) => format!("{}: DB 유지 — {reason}", target.name),
                     }
                 })
