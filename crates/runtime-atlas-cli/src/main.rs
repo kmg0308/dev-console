@@ -76,7 +76,7 @@ fn database_binding_command(
 ) -> i32 {
     let result = (|| -> Result<(), String> {
         let mut values = std::collections::BTreeMap::new();
-        if options.len() % 2 != 0 {
+        if !options.len().is_multiple_of(2) {
             return Err("Database binding options require values.".to_owned());
         }
         for pair in options.chunks_exact(2) {
