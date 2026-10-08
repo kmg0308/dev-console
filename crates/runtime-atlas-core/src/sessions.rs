@@ -571,7 +571,7 @@ pub fn process_identity(pid: u32) -> Result<ProcessIdentity, String> {
         return Err("process identity is unavailable".to_owned());
     }
     let info = unsafe { info.assume_init() };
-    if info.pbi_start_tvsec == 0 && info.pbi_start_tvusec == 0 {
+    if info.pbi_status == libc::SZOMB || (info.pbi_start_tvsec == 0 && info.pbi_start_tvusec == 0) {
         return Err("process identity is unavailable".to_owned());
     }
     Ok(ProcessIdentity {

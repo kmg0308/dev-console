@@ -78,6 +78,7 @@ export type RuntimeContainer = {
   id: string;
   name: string;
   image: string;
+  running: boolean;
   mountSources: string[];
   ports: PublishedPort[];
   worktreeLinks: Array<{ worktreePath: string; mountSource: string }>;
@@ -133,6 +134,7 @@ export type RuntimeAtlasSnapshot = {
   processes: RuntimeProcess[];
   relations: ProcessRelation[];
   containers: RuntimeContainer[];
+  databases: Array<{ label: string; worktreePath: string; containerName: string; state: "running" | "stopped" | "missing" | "unavailable" }>;
   actions: CustomAction[];
   actionRuns: ActionRun[];
 };
@@ -155,9 +157,9 @@ export const runtimeAtlasCommands = {
   setWorktreeOrder: (repositoryId: string, keys: string[]) =>
     invoke<void>("runtime_atlas_set_worktree_order", { repositoryId, keys }),
   stopAction: (actionId: string, worktreePath: string) =>
-    invoke<void>("runtime_atlas_stop_action", { actionId, worktreePath }),
+    invoke<string>("runtime_atlas_stop_action", { actionId, worktreePath }),
   stopProcess: (processIdentity: ProcessIdentity, worktreePath: string) =>
-    invoke<void>("runtime_atlas_stop_process", { processIdentity, worktreePath }),
+    invoke<string>("runtime_atlas_stop_process", { processIdentity, worktreePath }),
   linkProcess: (processIdentity: ProcessIdentity, worktreePath: string) =>
     invoke<void>("runtime_atlas_link_process", { processIdentity, worktreePath }),
   unlinkProcess: (processIdentity: ProcessIdentity) =>

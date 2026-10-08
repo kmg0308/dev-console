@@ -209,6 +209,7 @@ pub struct ParsedContainer {
     pub id: String,
     pub name: String,
     pub image: String,
+    pub running: bool,
     pub mount_sources: Vec<String>,
     pub ports: Vec<PublishedPort>,
 }
@@ -396,10 +397,23 @@ pub fn parse_docker_inspect(output: &str) -> Result<DockerInspectOutcome, Docker
             }
         }
 
+        let Some(running) = object
+            .get("State")
+            .and_then(|state| state.get("Running"))
+            .and_then(Value::as_bool)
+        else {
+            issues.push(issue(
+                object_index,
+                Some(id),
+                "container running state is missing",
+            ));
+            continue;
+        };
         containers.push(ParsedContainer {
             id: id.to_owned(),
             name,
             image,
+            running,
             mount_sources,
             ports: ports
                 .into_iter()
@@ -480,11 +494,11 @@ mod tests {
     #[test]
     fn parses_docker_mounts_ports_and_reports_partial_objects() {
         let fixture = r#"[
-          {"Id":"abc123","Name":"/web","Config":{"Image":"example/web:latest"},
+          {"State":{"Running":true},"Id":"abc123","Name":"/web","Config":{"Image":"example/web:latest"},
            "Mounts":[{"Source":"/tmp/project"}],
            "NetworkSettings":{"Ports":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"33000"}],"9229/tcp":null}}},
           {},
-          {"Id":"def456","Name":"/api","Mounts":{},"NetworkSettings":{"Ports":{"bad/tcp":[{"HostPort":"3"}]}}}
+          {"State":{"Running":false},"Id":"def456","Name":"/api","Mounts":{},"NetworkSettings":{"Ports":{"bad/tcp":[{"HostPort":"3"}]}}}
         ]"#;
         let outcome = parse_docker_inspect(fixture).unwrap();
         assert_eq!(outcome.state, DockerInspectState::Partial);

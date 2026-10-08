@@ -444,6 +444,8 @@ pub struct RuntimeContainer {
     pub id: String,
     pub name: String,
     pub image: String,
+    #[serde(default)]
+    pub running: bool,
     pub mount_sources: Vec<String>,
     pub ports: Vec<PublishedPort>,
 }

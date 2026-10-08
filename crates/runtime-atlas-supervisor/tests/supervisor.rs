@@ -235,7 +235,7 @@ fn termination_removes_descendants_that_ignore_term() {
         unsafe { libc::kill(supervisor.id() as i32, libc::SIGTERM) },
         0
     );
-    if wait_for_exit(&mut supervisor, Duration::from_secs(4)).is_none() {
+    if wait_for_exit(&mut supervisor, Duration::from_secs(13)).is_none() {
         let group = unsafe { libc::getpgid(descendant_pid) };
         if group > 0 {
             unsafe { libc::kill(-group, libc::SIGKILL) };

@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::CONFIGURATION_SCHEMA_VERSION;
 use crate::actions::validate_custom_action;
+use crate::databases::DatabaseBinding;
 use crate::models::{
     AppLanguage, CustomActionDefinition, RepositoryRegistration, RuntimeAtlasConfiguration,
     repository_uuid_key,
@@ -56,6 +57,96 @@ pub enum RuntimeAtlasStorageError {
 }
 
 pub type StorageResult<T> = Result<T, RuntimeAtlasStorageError>;
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseBindings {
+    schema_version: u32,
+    records: Vec<DatabaseBinding>,
+}
+
+pub struct DatabaseBindingStore {
+    file: AtomicJsonFile<DatabaseBindings>,
+}
+
+impl DatabaseBindingStore {
+    pub fn new(paths: &RuntimeAtlasPaths) -> Self {
+        Self {
+            file: AtomicJsonFile {
+                path: paths.directory.join("runtime-bindings.json"),
+                empty: || DatabaseBindings {
+                    schema_version: 1,
+                    records: Vec::new(),
+                },
+                damaged_notice: "Database bindings cannot be verified.",
+            },
+        }
+    }
+
+    // The same file lock excludes cooperating registrations until cleanup finishes.
+    pub fn with_records<T>(
+        &self,
+        operation: impl FnOnce(&[DatabaseBinding]) -> T,
+    ) -> StorageResult<T> {
+        self.file.with_lock(|| Ok(operation(&self.read()?.records)))
+    }
+
+    fn read(&self) -> StorageResult<DatabaseBindings> {
+        if !self.file.path.exists() {
+            return Ok((self.file.empty)());
+        }
+        let document: DatabaseBindings = fs::read(&self.file.path)
+            .ok()
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .ok_or_else(|| {
+                RuntimeAtlasStorageError::InvalidInput(
+                    "Database bindings cannot be verified.".to_owned(),
+                )
+            })?;
+        if document.schema_version != 1 || document.records.iter().any(|record| !record.is_valid())
+        {
+            return Err(RuntimeAtlasStorageError::InvalidInput(
+                "Database bindings cannot be verified.".to_owned(),
+            ));
+        }
+        Ok(document)
+    }
+
+    pub fn link(&self, record: DatabaseBinding) -> StorageResult<()> {
+        if !record.is_valid() {
+            return Err(RuntimeAtlasStorageError::InvalidInput(
+                "Invalid database binding.".to_owned(),
+            ));
+        }
+        self.file.with_lock(|| {
+            let mut document = self.read()?;
+            // Keep other owners, including parallel runs in the same worktree.
+            document.records.retain(|existing| {
+                existing.worktree_path != record.worktree_path
+                    || (existing.owner_identity != record.owner_identity
+                        && existing.retention_reason().is_some())
+            });
+            document.records.push(record);
+            atomic_write_json(&self.file.path, &document)
+        })
+    }
+
+    pub fn unlink(&self, worktree: &str, owner: Option<&ProcessIdentity>) -> StorageResult<()> {
+        self.file.with_lock(|| {
+            let mut document = self.read()?;
+            for record in &mut document.records {
+                if record.worktree_path == worktree
+                    && record.owner_identity.as_ref() == owner
+                    && (owner.is_some() || record.retention_reason().is_none())
+                {
+                    record.owner_identity = None;
+                    record.owner_pid = None;
+                }
+            }
+            atomic_write_json(&self.file.path, &document)
+        })
+    }
+}
 
 pub struct RuntimeAtlasProcessLease {
     _file: File,

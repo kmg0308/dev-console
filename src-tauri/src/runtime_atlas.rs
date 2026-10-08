@@ -16,6 +16,7 @@ use runtime_atlas_core::actions::{
 use runtime_atlas_core::command::output as command_output;
 #[cfg(target_os = "macos")]
 use runtime_atlas_core::command::output_with_timeout;
+use runtime_atlas_core::databases::stop_idle_database;
 use runtime_atlas_core::models::{
     AppLanguage, AtlasNotice, AtlasNoticeKind, AvailabilityState, CustomActionDefinition,
     CustomActionKind, RepositoryStatus, WorktreeNavigationDirection, WorktreeNavigationSession,
@@ -23,7 +24,8 @@ use runtime_atlas_core::models::{
     record_recent_worktree,
 };
 use runtime_atlas_core::observe::{
-    DockerObservation, ProcessObservation, observe_docker, observe_processes,
+    DockerObservation, ProcessObservation, observe_docker, observe_process_ancestry,
+    observe_process_tree, observe_processes, resolve_docker_executable, verify_worktrees_idle,
 };
 use runtime_atlas_core::relations::{
     ManagedSessionLink, ObservedProcess, PathFlavor, ProcessIdentity, TerminationSnapshot,
@@ -32,7 +34,7 @@ use runtime_atlas_core::relations::{
 use runtime_atlas_core::repository::{expand_worktree_order, inspect_repositories};
 use runtime_atlas_core::service::{
     ActionRun, ActionRunPhase, RepositorySnapshotInput, RuntimeAtlasSnapshot,
-    RuntimeAtlasSnapshotInput, build_snapshot,
+    RuntimeAtlasSnapshotInput, attach_database_statuses, build_snapshot,
 };
 use runtime_atlas_core::sessions::{
     SessionMarker, file_identity as marker_file_identity, open_session_control, process_identity,
@@ -40,8 +42,8 @@ use runtime_atlas_core::sessions::{
     registered_action_session, supervisor_executable_matches, validate_action_session,
 };
 use runtime_atlas_core::storage::{
-    ActionSessionRecord, ActionSessionStore, ConfigurationStore, RuntimeAtlasPaths,
-    RuntimeAtlasProcessLease, canonical_path,
+    ActionSessionRecord, ActionSessionStore, ConfigurationStore, DatabaseBindingStore,
+    RuntimeAtlasPaths, RuntimeAtlasProcessLease, canonical_path,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
@@ -442,7 +444,7 @@ impl RuntimeAtlasState {
                 message,
             });
         }
-        let snapshot = build_snapshot(RuntimeAtlasSnapshotInput {
+        let mut snapshot = build_snapshot(RuntimeAtlasSnapshotInput {
             generated_at: chrono::Utc::now(),
             language: loaded.value.app_language.unwrap_or(self.default_language),
             process_discovery: process_observation.availability,
@@ -462,6 +464,7 @@ impl RuntimeAtlasState {
             actions: loaded.value.custom_actions,
             action_runs,
         });
+        attach_database_statuses(&mut snapshot, &self.paths);
         let worktree_paths = snapshot
             .repositories
             .iter()
@@ -1048,7 +1051,7 @@ impl RuntimeAtlasState {
         Ok(current)
     }
 
-    fn stop_action(&self, action_id: Uuid, worktree_path: &str) -> Result<(), String> {
+    fn stop_action(&self, action_id: Uuid, worktree_path: &str) -> Result<String, String> {
         let _operation = self
             .action_operation
             .lock()
@@ -1060,7 +1063,160 @@ impl RuntimeAtlasState {
             .find(|action| action.id == action_id && action.kind == CustomActionKind::Session)
             .ok_or_else(|| "session action is no longer registered".to_owned())?;
         let worktree = self.verified_worktree(worktree_path)?;
-        self.stop_action_inner(action, &worktree, ActionRunPhase::Stopping)
+        let (_, sessions) = self.action_sessions_for_mutation()?;
+        let tree = sessions
+            .iter()
+            .find(|record| {
+                record.action_id == action_id
+                    && paths_equal(&record.worktree_path, &worktree, path_flavor())
+            })
+            .and_then(ActionSessionRecord::supervisor_identity)
+            .and_then(observe_process_tree)
+            .unwrap_or_default();
+        let targets = self.database_targets(&worktree, &tree);
+        self.stop_action_inner(action, &worktree, ActionRunPhase::Stopping)?;
+        Ok(self.cleanup_databases(targets))
+    }
+
+    fn database_targets(
+        &self,
+        worktree: &str,
+        tree: &[ProcessIdentity],
+    ) -> Result<Vec<runtime_atlas_core::models::RuntimeContainer>, String> {
+        let names = DatabaseBindingStore::new(&self.paths)
+            .with_records(|records| {
+                records
+                    .iter()
+                    .filter(|record| {
+                        paths_equal(&record.worktree_path, worktree, path_flavor())
+                            && record
+                                .owner_identity
+                                .as_ref()
+                                .is_some_and(|owner| tree.contains(owner))
+                    })
+                    .map(|record| record.container_name.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .map_err(string_error)?;
+        if names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let observation = observe_docker(resolve_docker_executable().as_deref());
+        if observation.availability.state != AvailabilityState::Available
+            || !observation.notices.is_empty()
+        {
+            return Err("Docker 조회를 완료하지 못해 DB 컨테이너를 유지합니다.".to_owned());
+        }
+        Ok(observation
+            .containers
+            .into_iter()
+            .filter(|container| container.running && names.contains(&container.name))
+            .collect())
+    }
+
+    fn cleanup_databases(
+        &self,
+        targets: Result<Vec<runtime_atlas_core::models::RuntimeContainer>, String>,
+    ) -> String {
+        let prefix = "서버를 중지했습니다.";
+        let targets = match targets {
+            Ok(targets) => targets,
+            Err(reason) => return format!("{prefix} {reason}"),
+        };
+        if targets.is_empty() {
+            return format!("{prefix} 종료한 실행에 등록된 DB 컨테이너가 없습니다.");
+        }
+        let Some(executable) = resolve_docker_executable() else {
+            return format!("{prefix} Docker CLI를 찾지 못해 DB를 유지합니다.");
+        };
+        let safety = (|| -> Result<(), String> {
+            let observation = observe_processes();
+            if observation.availability.state != AvailabilityState::Available
+                || !observation.notices.is_empty()
+            {
+                return Err("프로세스 조회가 불완전합니다.".to_owned());
+            }
+            let snapshot = self.compose_status(
+                observation,
+                DockerObservation {
+                    availability: runtime_atlas_core::models::DiscoveryAvailability::available(),
+                    containers: Vec::new(),
+                    notices: Vec::new(),
+                },
+            )?;
+            self.require_reconciled_marker_inventory()?;
+            if snapshot.repositories.iter().any(|repository| {
+                repository.availability != AvailabilityState::Available
+                    || repository
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.availability != AvailabilityState::Available)
+            }) {
+                return Err("일부 작업 폴더를 확인할 수 없습니다.".to_owned());
+            }
+            verify_worktrees_idle(
+                &snapshot
+                    .repositories
+                    .iter()
+                    .flat_map(|repository| &repository.worktrees)
+                    .map(|worktree| Path::new(&worktree.path))
+                    .collect::<Vec<_>>(),
+            )?;
+            if snapshot.action_runs.iter().any(|run| {
+                matches!(
+                    run.phase,
+                    ActionRunPhase::Pending
+                        | ActionRunPhase::Running
+                        | ActionRunPhase::Restarting
+                        | ActionRunPhase::Stopping
+                )
+            }) || !self.lock()?.active_runs.is_empty()
+            {
+                return Err("다른 작업 또는 서버가 실행 중입니다.".to_owned());
+            }
+            Ok(())
+        })();
+        let results = DatabaseBindingStore::new(&self.paths).with_records(|records| {
+            targets
+                .iter()
+                .map(|target| {
+                    let result = (|| -> Result<(), String> {
+                        safety.clone()?;
+                        if let Some(reason) = records
+                            .iter()
+                            .filter(|record| record.container_name == target.name)
+                            .find_map(|record| record.retention_reason())
+                        {
+                            return Err(reason.to_owned());
+                        }
+                        let docker = observe_docker(Some(&executable));
+                        if docker.availability.state != AvailabilityState::Available
+                            || !docker.notices.is_empty()
+                        {
+                            return Err("Docker 조회가 불완전합니다.".to_owned());
+                        }
+                        if docker
+                            .containers
+                            .iter()
+                            .any(|container| container.running && container.id != target.id)
+                        {
+                            return Err(
+                                "다른 컨테이너의 DB 사용 여부를 확인할 수 없습니다.".to_owned()
+                            );
+                        }
+                        stop_idle_database(&executable, target)
+                    })();
+                    match result {
+                        Ok(()) => format!("{}: DB 중지 (데이터 보존)", target.name),
+                        Err(reason) => format!("{}: DB 유지 — {reason}", target.name),
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        match results {
+            Ok(results) => format!("{prefix} {}", results.join(" ")),
+            Err(_) => format!("{prefix} DB 연결 정보를 확인하지 못해 컨테이너를 유지합니다."),
+        }
     }
 
     fn launch_action(
@@ -1143,6 +1299,19 @@ impl RuntimeAtlasState {
             .stderr(Stdio::piped());
         #[cfg(target_os = "macos")]
         apply_supervisor_environment(&mut command, &supervisor_environment);
+        command
+            .env("RUNTIME_ATLAS_HOME", &self.paths.directory)
+            .env(
+                "RUNTIME_ATLAS_CLI",
+                supervisor_executable
+                    .parent()
+                    .expect("supervisor has a parent")
+                    .join(if cfg!(windows) {
+                        "runtime-atlas.exe"
+                    } else {
+                        "runtime-atlas"
+                    }),
+            );
         configure_supervisor_launch(&mut command);
 
         if let Err(error) = self.revalidate_action_confirmation(confirmation) {
@@ -1584,7 +1753,11 @@ impl RuntimeAtlasState {
         &self,
         process_identity: &ProcessIdentity,
         worktree_path: &str,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
+        let _operation = self
+            .action_operation
+            .lock()
+            .map_err(|_| "Runtime Atlas action lock is poisoned".to_owned())?;
         let displayed = {
             let memory = self.lock()?;
             if !memory
@@ -1616,7 +1789,49 @@ impl RuntimeAtlasState {
             &runtime_atlas_identity,
         )
         .map_err(string_error)?;
-        terminate_verified(&plan.process_identity)
+        let ancestry = observe_process_ancestry(&plan.process_identity)
+            .ok_or("프로세스 실행 관계를 확인할 수 없습니다.")?;
+        let (_, sessions) = self.action_sessions_for_mutation()?;
+        if let Some(record) = sessions.iter().find(|record| {
+            paths_equal(&record.worktree_path, worktree_path, path_flavor())
+                && record
+                    .supervisor_identity()
+                    .is_some_and(|identity| ancestry.contains(identity))
+        }) {
+            let configuration = self.store.load().map_err(string_error)?.value;
+            let action = configuration
+                .custom_actions
+                .iter()
+                .find(|action| action.id == record.action_id)
+                .ok_or("등록 명령을 확인할 수 없습니다.")?;
+            let tree =
+                observe_process_tree(record.supervisor_identity().expect("matched supervisor"))
+                    .ok_or("하위 프로세스를 확인할 수 없습니다.")?;
+            let targets = self.database_targets(worktree_path, &tree);
+            self.stop_action_inner(action, worktree_path, ActionRunPhase::Stopping)?;
+            return Ok(self.cleanup_databases(targets));
+        }
+        let owners = DatabaseBindingStore::new(&self.paths)
+            .with_records(|records| {
+                records
+                    .iter()
+                    .filter(|record| {
+                        paths_equal(&record.worktree_path, worktree_path, path_flavor())
+                    })
+                    .filter_map(|record| record.owner_identity.clone())
+                    .filter(|identity| ancestry.contains(identity))
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .map_err(string_error)?;
+        if owners.len() > 1 {
+            return Err("서버 실행 소유자가 여러 개라 안전하게 중지할 수 없습니다.".to_owned());
+        }
+        let root = owners.into_iter().next().unwrap_or(plan.process_identity);
+        let tree = observe_process_tree(&root).ok_or("하위 프로세스를 확인할 수 없습니다.")?;
+        let targets = self.database_targets(worktree_path, &tree);
+        terminate_verified(&root)?;
+        wait_for_process_tree(&tree)?;
+        Ok(self.cleanup_databases(targets))
     }
 
     fn advance_navigation(
@@ -1780,7 +1995,7 @@ pub fn runtime_atlas_stop_action(
     state: State<'_, RuntimeAtlasState>,
     action_id: String,
     worktree_path: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     state.ensure_available()?;
     state.stop_action(
         Uuid::parse_str(&action_id).map_err(string_error)?,
@@ -1793,7 +2008,7 @@ pub fn runtime_atlas_stop_process(
     state: State<'_, RuntimeAtlasState>,
     process_identity: ProcessIdentity,
     worktree_path: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     state.ensure_available()?;
     state.stop_process(&process_identity, &worktree_path)
 }
@@ -2648,8 +2863,38 @@ fn wait_until_stopped(expected: &ProcessIdentity, timeout: Duration) -> bool {
     }
 }
 
+fn wait_for_process_tree(tree: &[ProcessIdentity]) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while tree
+        .iter()
+        .any(|identity| process_identity(identity.pid).as_ref() == Ok(identity))
+    {
+        if Instant::now() >= deadline {
+            // Detached children may outlive a parent that exits before forwarding SIGTERM.
+            for identity in tree.iter().rev() {
+                if process_identity(identity.pid).as_ref() == Ok(identity) {
+                    terminate_verified(identity)?;
+                }
+            }
+            if tree
+                .iter()
+                .any(|identity| !wait_until_stopped(identity, Duration::from_secs(2)))
+            {
+                return Err(
+                    "일부 하위 프로세스가 종료되지 않았습니다. DB 컨테이너를 유지합니다."
+                        .to_owned(),
+                );
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn stop_verified_supervisor(expected: &ProcessIdentity) -> Result<(), String> {
+    let tree = observe_process_tree(expected).ok_or("하위 프로세스를 확인할 수 없습니다.")?;
     if process_identity(expected.pid).as_ref() != Ok(expected) {
         return Err("supervisor identity changed before termination".to_owned());
     }
@@ -2659,13 +2904,15 @@ fn stop_verified_supervisor(expected: &ProcessIdentity) -> Result<(), String> {
     {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    wait_until_stopped(expected, Duration::from_secs(3))
+    wait_until_stopped(expected, Duration::from_secs(12))
         .then_some(())
-        .ok_or_else(|| "action supervisor did not stop after SIGTERM".to_owned())
+        .ok_or_else(|| "action supervisor did not stop after SIGTERM".to_owned())?;
+    wait_for_process_tree(&tree)
 }
 
 #[cfg(target_os = "windows")]
 fn stop_verified_supervisor(expected: &ProcessIdentity) -> Result<(), String> {
+    let tree = observe_process_tree(expected).ok_or("하위 프로세스를 확인할 수 없습니다.")?;
     use windows_sys::Win32::Foundation::{FALSE, TRUE};
     use windows_sys::Win32::System::Console::{
         AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent,
@@ -2684,13 +2931,14 @@ fn stop_verified_supervisor(expected: &ProcessIdentity) -> Result<(), String> {
             SetConsoleCtrlHandler(None, FALSE);
         }
     }
-    if wait_until_stopped(expected, Duration::from_secs(3)) {
-        return Ok(());
+    if wait_until_stopped(expected, Duration::from_secs(12)) {
+        return wait_for_process_tree(&tree);
     }
     terminate_verified(expected)?;
     wait_until_stopped(expected, Duration::from_secs(1))
         .then_some(())
-        .ok_or_else(|| "action supervisor did not stop".to_owned())
+        .ok_or_else(|| "action supervisor did not stop".to_owned())?;
+    wait_for_process_tree(&tree)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -2720,6 +2968,148 @@ mod tests {
             availability: DiscoveryAvailability::available(),
             containers: Vec::new(),
             notices: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn server_tree_fixture(worktree: &str) -> Child {
+        let script = r#"import subprocess,sys,socket,signal,time
+worker = 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",0)); s.listen(); time.sleep(60)'
+children = [subprocess.Popen([sys.executable,'-c',worker],start_new_session=True) for _ in range(3)]
+def stop(*args):
+    for child in children: child.terminate()
+    for child in children: child.wait()
+    sys.exit(0)
+signal.signal(signal.SIGTERM,stop)
+while True: time.sleep(0.05)
+"#;
+        Command::new("python3")
+            .args(["-c", script])
+            .current_dir(worktree)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait_for_fixture_server(
+        state: &RuntimeAtlasState,
+        child: &Child,
+        worktree: &str,
+    ) -> ProcessIdentity {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let root = process_identity(child.id()).unwrap();
+            let tree = observe_process_tree(&root).unwrap();
+            let snapshot = state
+                .compose_status(observe_processes(), empty_docker_observation())
+                .unwrap();
+            let listeners = snapshot
+                .processes
+                .iter()
+                .filter(|process| {
+                    tree.contains(&process.identity) && process.cwd.as_deref() == Some(worktree)
+                })
+                .collect::<Vec<_>>();
+            if listeners.len() == 3 {
+                return listeners[0].identity.clone();
+            }
+            assert!(Instant::now() < deadline, "fixture listeners did not start");
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn stop_server_tree_only_sends_verified_graceful_signals() {
+        let (_directory, state, _action, worktree) = action_confirmation_fixture();
+        let mut child = server_tree_fixture(&worktree);
+        wait_for_fixture_server(&state, &child, &worktree);
+        let root = process_identity(child.id()).unwrap();
+        let tree = observe_process_tree(&root).unwrap();
+        assert_eq!(tree.len(), 4);
+        terminate_verified(&root).unwrap();
+        wait_for_process_tree(&tree).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(
+            tree.iter()
+                .all(|identity| process_identity(identity.pid).as_ref() != Ok(identity))
+        );
+        assert!(
+            state
+                .cleanup_databases(Ok(Vec::new()))
+                .contains("등록된 DB 컨테이너가 없습니다")
+        );
+        assert!(
+            state
+                .cleanup_databases(Err("Docker 조회 실패".into()))
+                .contains("Docker 조회 실패")
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected local PostgreSQL container; stops it without deleting data"]
+    #[cfg(target_os = "macos")]
+    fn live_shared_database_stop_preserves_other_users_then_stops_the_last_run() {
+        let name = std::env::var("RUNTIME_ATLAS_QA_DB").expect("select a local QA DB container");
+        let executable = resolve_docker_executable().unwrap();
+        let before = observe_docker(Some(&executable))
+            .containers
+            .into_iter()
+            .find(|container| container.name == name && container.running)
+            .unwrap();
+        let (_directory, state, _action, worktree) = action_confirmation_fixture();
+        let store = DatabaseBindingStore::new(&state.paths);
+        let owner = process_identity(std::process::id()).unwrap();
+        let other = runtime_atlas_core::databases::DatabaseBinding {
+            id: Uuid::new_v4(),
+            kind: "database".into(),
+            label: "other_worktree_db".into(),
+            worktree_path: "/other-worktree".into(),
+            container_name: name.clone(),
+            owner_pid: Some(owner.pid),
+            owner_identity: Some(owner.clone()),
+            registered_at: chrono::Utc::now(),
+        };
+        store.link(other.clone()).unwrap();
+        for last in [false, true] {
+            let mut child = server_tree_fixture(&worktree);
+            let listener = wait_for_fixture_server(&state, &child, &worktree);
+            let root = process_identity(child.id()).unwrap();
+            let tree = observe_process_tree(&root).unwrap();
+            store
+                .link(runtime_atlas_core::databases::DatabaseBinding {
+                    id: Uuid::new_v4(),
+                    owner_pid: Some(root.pid),
+                    owner_identity: Some(root),
+                    worktree_path: worktree.clone(),
+                    label: "fixture_db".into(),
+                    ..other.clone()
+                })
+                .unwrap();
+            if last {
+                store.unlink(&other.worktree_path, Some(&owner)).unwrap();
+            }
+            let report = state.stop_process(&listener, &worktree).unwrap();
+            assert!(child.wait().unwrap().success());
+            assert!(
+                tree.iter()
+                    .all(|identity| process_identity(identity.pid).as_ref() != Ok(identity))
+            );
+            assert!(
+                report.contains(if last { "DB 중지" } else { "DB 유지" }),
+                "{report}"
+            );
+            let after = observe_docker(Some(&executable))
+                .containers
+                .into_iter()
+                .find(|container| container.id == before.id)
+                .unwrap();
+            assert_eq!(after.running, !last);
+            assert_eq!(after.mount_sources, before.mount_sources);
+            assert_eq!(after.image, before.image);
+            println!("{report}");
         }
     }
 
@@ -3235,7 +3625,7 @@ mod tests {
             );
         };
 
-        unchanged(state.stop_action(action.id, &worktree));
+        unchanged(state.stop_action(action.id, &worktree).map(|_| ()));
         unchanged(state.confirm_action(preview.confirmation_token));
         unchanged(state.shutdown_for_update());
         assert!(state.require_actions_available().is_ok());
