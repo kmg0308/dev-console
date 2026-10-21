@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420",
     "build": "tsc --noEmit && vite build",
-    "check": "npm run build && npm run test:runtime-atlas:reorder && npm run test:runtime-atlas:action-scope && npm run test:release && npm run test:release-signature && npm run test:updater:windows",
+    "check": "npm run build && npm run test:token-meter:history && npm run test:runtime-atlas:reorder && npm run test:runtime-atlas:action-scope && npm run test:release && npm run test:release-signature && npm run test:updater:windows",
+    "test:token-meter:history": "node ui/src/features/token-meter/limitHistory.ts",
     "sidecars": "node scripts/prepare-sidecars.mjs",
     "build:runtime": "npm run build && npm run sidecars",
     "package:runtime-atlas:macos": "bash scripts/package-runtime-atlas-macos.sh",

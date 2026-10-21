@@ -15,13 +15,14 @@ use chrono::{Duration as ChronoDuration, Local, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, State};
 use token_meter_core::{
+    account::WeeklyUsageSample,
     account_service::fetch_codex_account_usage,
     cache::{OriginKind, TokenEventCache},
     cleanup::{CodexSessionCleanupPlan, CodexSessionEvidence, plan_codex_session_cleanup},
     cleanup_archive::{cleanup_source_snapshot, create_cleanup_archive, remove_cleanup_sources},
     dashboard::{
-        DashboardAccountState, DashboardRequest, DashboardSettings, DashboardSnapshotDto,
-        compose_dashboard, dashboard_event_window_start,
+        DashboardAccount, DashboardAccountState, DashboardRequest, DashboardSettings,
+        DashboardSnapshotDto, compose_dashboard, dashboard_event_window_start,
     },
     models::{ScanResult, SyncFolderStatus, TokenDeviceMetadata},
     scanner::{ScannerRoots, TokenLogScanner},
@@ -49,6 +50,7 @@ struct DashboardData {
     loaded_after: Option<chrono::DateTime<Utc>>,
     account: DashboardAccountState,
     account_generation: u64,
+    history_error: Option<String>,
 }
 
 struct PendingCleanup {
@@ -71,6 +73,15 @@ pub struct SourcePaths {
 #[serde(rename_all = "camelCase")]
 pub struct RebuildCacheResult {
     event_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountSnapshot {
+    codex_account: DashboardAccount,
+    weekly_history: Vec<WeeklyUsageSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +124,7 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, Str
             loaded_after: None,
             account: DashboardAccountState::Updating(None),
             account_generation: 0,
+            history_error: None,
         })),
         cleanup_plan: Mutex::new(None),
         data_dir,
@@ -178,6 +190,13 @@ pub fn token_meter_dashboard(
 #[tauri::command]
 pub fn token_meter_cancel_dashboard_refresh(state: State<'_, TokenMeterState>) {
     state.cancel_scan();
+}
+
+#[tauri::command(async)]
+pub fn token_meter_refresh_account(
+    state: State<'_, TokenMeterState>,
+) -> Result<AccountSnapshot, String> {
+    state.refresh_account()
 }
 
 #[tauri::command(async)]
@@ -396,7 +415,13 @@ impl TokenMeterState {
         )
         .map_err(string_error)?;
         dashboard.settings.icloud_sync_folder_path = self.icloud_sync_folder_path();
-        Ok(DashboardSnapshotDto::from(dashboard))
+        drop(data);
+        let account = self.account_snapshot()?;
+        let mut snapshot = DashboardSnapshotDto::from(dashboard);
+        snapshot.codex_account = Some(account.codex_account);
+        snapshot.weekly_history = account.weekly_history;
+        snapshot.history_error = account.history_error;
+        Ok(snapshot)
     }
 
     fn refresh_dashboard_data(
@@ -424,38 +449,77 @@ impl TokenMeterState {
             .dashboard_data
             .lock()
             .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+        data.scan = Some(scan);
+        data.loaded_after = event_after;
+        drop(data);
+        let Some(generation) = self.begin_account_refresh()? else {
+            return Ok(event_count);
+        };
+
+        let executable = self.account_executable(settings).map(OsStr::to_os_string);
+        let dashboard_data = Arc::clone(&self.dashboard_data);
+        let cache_path = self.cache_path();
+        thread::spawn(move || {
+            let account = fetch_account(executable.as_deref());
+            update_account_if_current(&dashboard_data, generation, account, &cache_path);
+        });
+        Ok(event_count)
+    }
+
+    fn begin_account_refresh(&self) -> Result<Option<u64>, String> {
+        let mut data = self
+            .dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
         data.account_generation = data.account_generation.wrapping_add(1);
-        let generation = data.account_generation;
+        if self.source_isolation_root.is_some() {
+            data.account = DashboardAccountState::Unavailable(
+                "Codex account access is disabled in updater QA.".to_owned(),
+            );
+            return Ok(None);
+        }
         let previous = match &data.account {
             DashboardAccountState::Available(usage)
             | DashboardAccountState::Updating(Some(usage)) => Some(usage.clone()),
             DashboardAccountState::Updating(None) | DashboardAccountState::Unavailable(_) => None,
         };
-        data.scan = Some(scan);
-        data.loaded_after = event_after;
-        if self.source_isolation_root.is_some() {
-            data.account = DashboardAccountState::Unavailable(
-                "Codex account access is disabled in updater QA.".to_owned(),
-            );
-            return Ok(event_count);
-        }
         data.account = DashboardAccountState::Updating(previous);
-        drop(data);
+        Ok(Some(data.account_generation))
+    }
 
-        let executable = self.account_executable(settings).map(OsStr::to_os_string);
-        let dashboard_data = Arc::clone(&self.dashboard_data);
-        thread::spawn(move || {
-            let account = fetch_codex_account_usage(executable.as_deref(), Duration::from_secs(15))
-                .map(DashboardAccountState::Available)
-                .unwrap_or_else(|_| {
-                    DashboardAccountState::Unavailable(
-                "Codex account status is unavailable. Check that Codex is installed and signed in."
-                    .to_owned(),
-            )
-                });
-            update_account_if_current(&dashboard_data, generation, account);
-        });
-        Ok(event_count)
+    fn refresh_account(&self) -> Result<AccountSnapshot, String> {
+        let settings = self.load_settings()?;
+        if let Some(generation) = self.begin_account_refresh()? {
+            let account = fetch_account(self.account_executable(&settings));
+            update_account_if_current(
+                &self.dashboard_data,
+                generation,
+                account,
+                &self.cache_path(),
+            );
+        }
+        self.account_snapshot()
+    }
+
+    fn account_snapshot(&self) -> Result<AccountSnapshot, String> {
+        let data = self
+            .dashboard_data
+            .lock()
+            .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
+        let codex_account = DashboardAccount::from(&data.account);
+        let mut history_error = data.history_error.clone();
+        drop(data);
+        let weekly_history = TokenEventCache::open_or_create(&self.cache_path())
+            .and_then(|cache| cache.weekly_usage_history(Utc::now() - ChronoDuration::days(7)))
+            .unwrap_or_else(|_| {
+                history_error = Some("Could not load usage history.".to_owned());
+                Vec::new()
+            });
+        Ok(AccountSnapshot {
+            codex_account,
+            weekly_history,
+            history_error,
+        })
     }
 
     fn invalidate_dashboard_data(&self) -> Result<(), String> {
@@ -840,6 +904,7 @@ fn update_account_if_current(
     dashboard_data: &Mutex<DashboardData>,
     generation: u64,
     account: DashboardAccountState,
+    cache_path: &Path,
 ) -> bool {
     let Ok(mut data) = dashboard_data.lock() else {
         return false;
@@ -847,8 +912,27 @@ fn update_account_if_current(
     if data.account_generation != generation {
         return false;
     }
+    if let DashboardAccountState::Available(usage) = &account
+        && usage.seven_day_window.is_some()
+    {
+        data.history_error = TokenEventCache::open_or_create(cache_path)
+            .and_then(|cache| cache.record_weekly_usage(usage))
+            .err()
+            .map(|_| "Could not save usage history.".to_owned());
+    }
     data.account = account;
     true
+}
+
+fn fetch_account(executable: Option<&OsStr>) -> DashboardAccountState {
+    fetch_codex_account_usage(executable, Duration::from_secs(15))
+        .map(DashboardAccountState::Available)
+        .unwrap_or_else(|_| {
+            DashboardAccountState::Unavailable(
+                "Codex account status is unavailable. Check that Codex is installed and signed in."
+                    .to_owned(),
+            )
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -1193,6 +1277,7 @@ mod tests {
                 loaded_after: None,
                 account: DashboardAccountState::Updating(None),
                 account_generation: 0,
+                history_error: None,
             })),
             cleanup_plan: Mutex::new(None),
             data_dir: root.join("TokenMeter"),
@@ -1446,6 +1531,7 @@ mod tests {
             &state.dashboard_data,
             1,
             DashboardAccountState::Unavailable("stale".into()),
+            &state.cache_path(),
         ));
         assert!(matches!(
             &state.dashboard_data.lock().unwrap().account,
@@ -1455,7 +1541,149 @@ mod tests {
             &state.dashboard_data,
             2,
             DashboardAccountState::Unavailable("current".into()),
+            &state.cache_path(),
         ));
+    }
+
+    fn weekly_account(used_percent: i64) -> token_meter_core::account::CodexAccountUsage {
+        let fetched_at = Utc::now();
+        token_meter_core::account::CodexAccountUsage {
+            five_hour_window: None,
+            seven_day_window: Some(token_meter_core::account::CodexRateLimitWindow {
+                used_percent,
+                window_duration_minutes: 10_080,
+                resets_at: fetched_at + ChronoDuration::days(3),
+            }),
+            reset_credits: None,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn account_only_refresh_preserves_history_on_failure_without_scanning_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let usage = weekly_account(42);
+        TokenEventCache::open_or_create(&state.cache_path())
+            .unwrap()
+            .record_weekly_usage(&usage)
+            .unwrap();
+
+        let snapshot = state.refresh_account().unwrap();
+
+        assert_eq!(snapshot.codex_account.status, "unavailable");
+        assert_eq!(snapshot.weekly_history.len(), 1);
+        assert_eq!(snapshot.weekly_history[0].fetched_at, usage.fetched_at);
+        assert_eq!(snapshot.weekly_history[0].used_percent, 42);
+        assert!(snapshot.history_error.is_none());
+        assert!(state.dashboard_data.lock().unwrap().scan.is_none());
+        let restarted = self::state(directory.path());
+        assert_eq!(
+            restarted.account_snapshot().unwrap().weekly_history,
+            snapshot.weekly_history
+        );
+        state
+            .refresh_dashboard_data(
+                &state.load_settings().unwrap(),
+                true,
+                None,
+                None,
+                true,
+                || false,
+            )
+            .unwrap();
+        assert_eq!(
+            state.account_snapshot().unwrap().weekly_history,
+            snapshot.weekly_history
+        );
+    }
+
+    #[test]
+    fn only_current_successful_weekly_responses_are_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        state.dashboard_data.lock().unwrap().account_generation = 2;
+        assert!(!update_account_if_current(
+            &state.dashboard_data,
+            1,
+            DashboardAccountState::Available(weekly_account(10)),
+            &state.cache_path(),
+        ));
+        assert!(!state.cache_path().exists());
+        let usage = weekly_account(42);
+        assert!(update_account_if_current(
+            &state.dashboard_data,
+            2,
+            DashboardAccountState::Available(usage.clone()),
+            &state.cache_path(),
+        ));
+        let mut missing = usage.clone();
+        missing.seven_day_window = None;
+        update_account_if_current(
+            &state.dashboard_data,
+            2,
+            DashboardAccountState::Available(missing),
+            &state.cache_path(),
+        );
+        update_account_if_current(
+            &state.dashboard_data,
+            2,
+            DashboardAccountState::Unavailable("fixture failure".into()),
+            &state.cache_path(),
+        );
+        let snapshot = state.account_snapshot().unwrap();
+        assert_eq!(snapshot.weekly_history.len(), 1);
+        assert_eq!(snapshot.weekly_history[0].used_percent, 42);
+        assert_eq!(snapshot.weekly_history[0].fetched_at, usage.fetched_at);
+    }
+
+    #[test]
+    fn history_write_failure_is_visible_without_discarding_current_account_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        fs::create_dir_all(&state.data_dir).unwrap();
+        fs::create_dir(state.cache_path()).unwrap();
+        update_account_if_current(
+            &state.dashboard_data,
+            0,
+            DashboardAccountState::Available(weekly_account(42)),
+            &state.cache_path(),
+        );
+        let data = state.dashboard_data.lock().unwrap();
+        assert!(data.history_error.is_some());
+        assert!(matches!(data.account, DashboardAccountState::Available(_)));
+        drop(data);
+        let mut missing = weekly_account(0);
+        missing.seven_day_window = None;
+        update_account_if_current(
+            &state.dashboard_data,
+            0,
+            DashboardAccountState::Available(missing),
+            &state.cache_path(),
+        );
+        assert!(state.dashboard_data.lock().unwrap().history_error.is_some());
+        let snapshot = state.account_snapshot().unwrap();
+        assert!(snapshot.history_error.is_some());
+        assert!(snapshot.weekly_history.is_empty());
+    }
+
+    #[test]
+    fn account_only_refresh_honors_updater_qa_isolation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = state(directory.path());
+        state.source_isolation_root = Some(directory.path().join("sources"));
+        assert!(state.begin_account_refresh().unwrap().is_none());
+        let snapshot = state.refresh_account().unwrap();
+        assert_eq!(snapshot.codex_account.status, "unavailable");
+        assert!(
+            snapshot
+                .codex_account
+                .message
+                .unwrap()
+                .contains("updater QA")
+        );
+        assert!(snapshot.weekly_history.is_empty());
+        assert!(state.dashboard_data.lock().unwrap().scan.is_none());
     }
 
     #[cfg(unix)]

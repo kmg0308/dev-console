@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    account::{CodexAccountUsage, CodexRateLimitWindow, CodexResetCreditSummary},
+    account::{
+        CodexAccountUsage, CodexRateLimitWindow, CodexResetCreditSummary, WeeklyUsageSample,
+    },
     aggregation::{self, BucketInterval, DateInterval, TimeRangePreset},
     models::{
         GroupedUsageRow, ScanResult, ScanSourceStatus, SyncFolderStatus, TokenDeviceMetadata,
@@ -550,6 +552,9 @@ pub struct DashboardSnapshotDto {
     pub source_statuses: Vec<ScanSourceStatus>,
     pub sync_status: SyncFolderStatus,
     pub codex_account: Option<DashboardAccount>,
+    pub weekly_history: Vec<WeeklyUsageSample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_error: Option<String>,
     pub settings: DashboardSettings,
 }
 
@@ -607,6 +612,8 @@ impl From<DashboardSnapshot> for DashboardSnapshotDto {
             source_statuses: snapshot.source_statuses,
             sync_status: snapshot.sync_status,
             codex_account: snapshot.codex_account,
+            weekly_history: Vec::new(),
+            history_error: None,
             settings: snapshot.settings,
         }
     }

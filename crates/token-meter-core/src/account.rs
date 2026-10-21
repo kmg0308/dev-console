@@ -32,6 +32,14 @@ pub struct CodexAccountUsage {
     pub fetched_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WeeklyUsageSample {
+    pub fetched_at: DateTime<Utc>,
+    pub used_percent: i64,
+    pub resets_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CodexAccountUsageError {
     #[error("Codex returned an account status this version cannot read.")]

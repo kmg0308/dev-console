@@ -4,7 +4,7 @@ use std::{
     fs,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
     params_from_iter,
@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::{
     CACHE_PARSER_VERSION,
+    account::{CodexAccountUsage, WeeklyUsageSample},
     models::{TokenEvent, TokenSource, TokenUsage},
 };
 
@@ -65,7 +66,23 @@ const REQUIRED_TABLES: &[(&str, &[ExpectedColumn])] = &[
             ExpectedColumn::required("updated_at", "REAL"),
         ],
     ),
+    (
+        "weekly_usage_history",
+        &[
+            ExpectedColumn::required_pk("minute", "INTEGER", 1),
+            ExpectedColumn::required("fetched_at", "TEXT"),
+            ExpectedColumn::required("used_percent", "INTEGER"),
+            ExpectedColumn::required("resets_at", "TEXT"),
+        ],
+    ),
 ];
+
+const WEEKLY_HISTORY_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS weekly_usage_history (
+    minute INTEGER NOT NULL PRIMARY KEY,
+    fetched_at TEXT NOT NULL,
+    used_percent INTEGER NOT NULL CHECK(used_percent BETWEEN 0 AND 100),
+    resets_at TEXT NOT NULL
+);";
 
 const REQUIRED_INDEXES: &[&str] = &[
     "idx_origin_files_rebuild",
@@ -183,7 +200,7 @@ impl TokenEventCache {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
             )?;
             connection.busy_timeout(std::time::Duration::from_secs(5))?;
-            if schema_state(&connection)? == SchemaState::PreHermes
+            if schema_state(&connection)? != SchemaState::Current
                 || !has_all_required_indexes(&connection)?
             {
                 migrate_known_schema(&mut connection)?;
@@ -726,6 +743,64 @@ impl TokenEventCache {
             .collect())
     }
 
+    pub fn record_weekly_usage(&self, usage: &CodexAccountUsage) -> Result<(), CacheError> {
+        let Some(window) = &usage.seven_day_window else {
+            return Ok(());
+        };
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO weekly_usage_history (minute, fetched_at, used_percent, resets_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(minute) DO UPDATE SET
+                fetched_at = excluded.fetched_at,
+                used_percent = excluded.used_percent,
+                resets_at = excluded.resets_at
+             WHERE excluded.fetched_at > weekly_usage_history.fetched_at",
+            params![
+                usage.fetched_at.timestamp().div_euclid(60),
+                usage.fetched_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+                window.used_percent,
+                window.resets_at.to_rfc3339_opts(SecondsFormat::Nanos, true),
+            ],
+        )?;
+        // The UI offers at most seven days; keep the boundary minute without averaging samples.
+        transaction.execute(
+            "DELETE FROM weekly_usage_history WHERE minute < ?1",
+            [(usage.fetched_at - Duration::days(7))
+                .timestamp()
+                .div_euclid(60)],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn weekly_usage_history(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<WeeklyUsageSample>, CacheError> {
+        let mut statement = self.connection.prepare(
+            "SELECT fetched_at, used_percent, resets_at FROM weekly_usage_history
+             WHERE minute >= ?1 ORDER BY minute ASC",
+        )?;
+        let rows = statement.query_map([since.timestamp().div_euclid(60)], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (fetched_at, used_percent, resets_at) = row?;
+            Ok(WeeklyUsageSample {
+                fetched_at: DateTime::parse_from_rfc3339(&fetched_at)?.with_timezone(&Utc),
+                used_percent,
+                resets_at: DateTime::parse_from_rfc3339(&resets_at)?.with_timezone(&Utc),
+            })
+        })
+        .collect()
+    }
+
     pub fn clear(&self) -> Result<(), CacheError> {
         let transaction =
             Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
@@ -898,13 +973,7 @@ impl TokenEventCache {
                 maximum: MAX_FIXTURE_MIGRATION_BYTES,
             });
         }
-        Self::validate_file_without_writing(path)?;
-
-        let mut connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-        )?;
-        validate_schema(&connection)?;
+        let mut connection = Self::open_or_create(path)?.connection;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS token_meter_migrations (
@@ -1080,6 +1149,7 @@ fn create_schema(connection: &mut Connection) -> Result<(), CacheError> {
             PRIMARY KEY (origin_path, device_id, session_id)
         );",
     )?;
+    transaction.execute_batch(WEEKLY_HISTORY_SCHEMA)?;
     transaction.commit()?;
     validate_schema(connection)
 }
@@ -1088,6 +1158,7 @@ fn create_schema(connection: &mut Connection) -> Result<(), CacheError> {
 enum SchemaState {
     Current,
     PreHermes,
+    PreWeeklyHistory,
 }
 
 fn schema_state(connection: &Connection) -> Result<SchemaState, CacheError> {
@@ -1095,21 +1166,30 @@ fn schema_state(connection: &Connection) -> Result<SchemaState, CacheError> {
         validate_table(connection, table, expected)?;
     }
 
-    let (table, expected) = REQUIRED_TABLES[2];
-    let actual = table_columns(connection, table)?;
-    if actual.is_empty() {
-        let object_exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
-            [table],
-            |row| row.get(0),
-        )?;
-        if object_exists {
-            return Err(CacheError::SchemaMismatch { table, actual });
+    let mut state = SchemaState::Current;
+    for (table, expected) in &REQUIRED_TABLES[2..] {
+        let actual = table_columns(connection, table)?;
+        if actual.is_empty() {
+            let object_exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+                [table],
+                |row| row.get(0),
+            )?;
+            if object_exists {
+                return Err(CacheError::SchemaMismatch { table, actual });
+            }
+            if state == SchemaState::Current {
+                state = if *table == "hermes_checkpoints" {
+                    SchemaState::PreHermes
+                } else {
+                    SchemaState::PreWeeklyHistory
+                };
+            }
+        } else {
+            ensure_columns_match(table, actual, expected)?;
         }
-        return Ok(SchemaState::PreHermes);
     }
-    ensure_columns_match(table, actual, expected)?;
-    Ok(SchemaState::Current)
+    Ok(state)
 }
 
 fn migrate_known_schema(connection: &mut Connection) -> Result<(), CacheError> {
@@ -1131,6 +1211,7 @@ fn migrate_known_schema(connection: &mut Connection) -> Result<(), CacheError> {
         );",
         )?;
     }
+    transaction.execute_batch(WEEKLY_HISTORY_SCHEMA)?;
     transaction.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_origin_files_rebuild
             ON origin_files(origin_kind, parser_version, origin_path);
@@ -1255,6 +1336,8 @@ impl ExpectedColumn {
 
 #[derive(Debug, Error)]
 pub enum CacheError {
+    #[error("usage history timestamp is invalid: {0}")]
+    InvalidHistoryTimestamp(#[from] chrono::ParseError),
     #[error("cache I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("cache SQLite operation failed: {0}")]
@@ -1275,6 +1358,134 @@ pub enum CacheError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn account_usage(fetched_at: DateTime<Utc>, used_percent: i64) -> CodexAccountUsage {
+        CodexAccountUsage {
+            five_hour_window: None,
+            seven_day_window: Some(crate::account::CodexRateLimitWindow {
+                used_percent,
+                window_duration_minutes: 10_080,
+                resets_at: fetched_at + Duration::days(3),
+            }),
+            reset_credits: None,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn weekly_history_keeps_latest_original_sample_and_survives_cache_clear_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite");
+        let minute = DateTime::parse_from_rfc3339("2026-10-21T01:02:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let latest = account_usage(
+            minute + Duration::seconds(59) + Duration::nanoseconds(123_456_789),
+            42,
+        );
+        let next = account_usage(minute + Duration::minutes(1), 0);
+        {
+            let cache = TokenEventCache::open_or_create(&path).unwrap();
+            cache
+                .record_weekly_usage(&account_usage(minute, 20))
+                .unwrap();
+            cache.record_weekly_usage(&latest).unwrap();
+            cache
+                .record_weekly_usage(&account_usage(minute + Duration::seconds(30), 30))
+                .unwrap();
+            cache.record_weekly_usage(&next).unwrap();
+            cache.clear().unwrap();
+        }
+        let cache = TokenEventCache::open_or_create(&path).unwrap();
+        let history = cache.weekly_usage_history(minute).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].fetched_at, latest.fetched_at);
+        assert_eq!(history[0].used_percent, 42);
+        assert_eq!(
+            history[0].resets_at,
+            latest.seven_day_window.unwrap().resets_at
+        );
+        assert_eq!(history[1].used_percent, 0);
+    }
+
+    #[test]
+    fn weekly_history_retains_seven_days_and_never_synthesizes_missing_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache =
+            TokenEventCache::open_or_create(&directory.path().join("cache.sqlite")).unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-10-21T01:02:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let boundary = now - Duration::days(7);
+        cache
+            .record_weekly_usage(&account_usage(boundary - Duration::minutes(1), 10))
+            .unwrap();
+        cache
+            .record_weekly_usage(&account_usage(boundary - Duration::seconds(20), 20))
+            .unwrap();
+        cache.record_weekly_usage(&account_usage(now, 40)).unwrap();
+        let mut missing = account_usage(now + Duration::minutes(1), 0);
+        missing.seven_day_window = None;
+        cache.record_weekly_usage(&missing).unwrap();
+        let history = cache.weekly_usage_history(boundary).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].used_percent, 20);
+        assert_eq!(history[1].used_percent, 40);
+        assert_eq!(cache.weekly_usage_history(now).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn existing_cache_adds_history_without_changing_existing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite");
+        {
+            let cache = TokenEventCache::open_or_create(&path).unwrap();
+            insert_origin(&cache, "/existing/codex.jsonl", "codex");
+            cache
+                .connection()
+                .execute("DROP TABLE weekly_usage_history", [])
+                .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        TokenEventCache::validate_file_without_writing(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        TokenEventCache::mark_fixture_migrated(&path, "history-schema").unwrap();
+        let cache = TokenEventCache::open_or_create(&path).unwrap();
+        assert!(cache.has_migration_marker("history-schema").unwrap());
+        assert!(
+            cache
+                .origin_file(OriginKind::LocalLog, "/existing/codex.jsonl")
+                .unwrap()
+                .is_some()
+        );
+        assert!(cache.weekly_usage_history(Utc::now()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_history_is_rejected_before_migrating_other_missing_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.sqlite");
+        {
+            let cache = TokenEventCache::open_or_create(&path).unwrap();
+            cache
+                .connection()
+                .execute_batch(
+                    "DROP TABLE hermes_checkpoints;
+                 DROP TABLE weekly_usage_history;
+                 CREATE TABLE weekly_usage_history (minute TEXT);",
+                )
+                .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            TokenEventCache::open_or_create(&path),
+            Err(CacheError::SchemaMismatch {
+                table: "weekly_usage_history",
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
 
     fn insert_origin(cache: &TokenEventCache, path: &str, source: &str) {
         cache
