@@ -26,6 +26,8 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactNode } from "react";
 import { pickDirectory } from "../../folder-dialog";
+import { WeeklyHistory } from "./WeeklyHistory";
+import type { WeeklyHistorySample } from "./limitHistory";
 import "./token-meter.css";
 
 type TokenSource = "all" | "codex" | "claude";
@@ -117,6 +119,8 @@ export type DashboardSnapshot = {
   sourceStatuses: DataSourceStatus[];
   syncStatus: SyncStatus;
   codexAccount: CodexAccount | null;
+  weeklyHistory: WeeklyHistorySample[];
+  historyError?: string;
   settings: {
     showFullTokenNumbers: boolean;
     syncFolderPath?: string;
@@ -339,6 +343,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   const [snapshot, setSnapshot] = useState<DashboardSnapshot>();
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string>();
+  const [accountError, setAccountError] = useState<string>();
   const [reload, setReload] = useState(0);
   const refreshRequested = useRef(false);
   const refreshAfterLoad = useRef(true);
@@ -359,6 +364,10 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   const wasActive = useRef(false);
   const activeRef = useRef(active);
   activeRef.current = active;
+  const currentSnapshot = useRef(snapshot);
+  currentSnapshot.current = snapshot;
+  const accountRefreshInFlight = useRef(false);
+  const accountVersion = useRef(0);
 
   function refreshDashboard() {
     refreshRequested.current = true;
@@ -393,6 +402,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       },
     };
     const refresh = refreshRequested.current;
+    const requestedAccountVersion = accountVersion.current;
     refreshRequested.current = false;
     loadInFlight.current = true;
     if (refresh || !snapshot) setLoading(true);
@@ -400,7 +410,9 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
     invoke<DashboardSnapshot>("token_meter_dashboard", { request, refresh })
       .then((value) => {
         if (stale) return;
-        setSnapshot(value);
+        setSnapshot((current) => current && accountVersion.current !== requestedAccountVersion
+          ? { ...value, codexAccount: current.codexAccount, weeklyHistory: current.weeklyHistory, historyError: current.historyError }
+          : value);
         setProject(value.selection.filters.project ?? "");
         setModel(value.selection.filters.model ?? "");
         setDevice(value.selection.filters.device ?? "");
@@ -455,6 +467,35 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
     return () => {
       window.clearInterval(refreshTimer);
       window.clearInterval(clockTimer);
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) return;
+    let stale = false;
+    async function refreshAccount() {
+      if (document.visibilityState !== "visible" || loadInFlight.current || accountRefreshInFlight.current || !currentSnapshot.current || currentSnapshot.current.codexAccount?.status === "updating") return;
+      accountRefreshInFlight.current = true;
+      try {
+        const account = await invoke<Pick<DashboardSnapshot, "codexAccount" | "weeklyHistory" | "historyError">>("token_meter_refresh_account");
+        if (!stale) {
+          accountVersion.current += 1;
+          setAccountError(undefined);
+          setSnapshot((current) => current ? { ...current, ...account, historyError: account.historyError } : current);
+        }
+      } catch (reason) {
+        if (!stale) setAccountError(errorMessage(reason));
+      } finally {
+        accountRefreshInFlight.current = false;
+      }
+    }
+    const timer = window.setInterval(() => void refreshAccount(), 60_000);
+    const onVisibility = () => { void refreshAccount(); };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stale = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [active]);
 
@@ -601,6 +642,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       </header>
 
       <CodexLimits account={snapshot.codexAccount} now={now} />
+      <details className="tm-details tm-limit-history"><summary><CollapsibleLabel>7 day usage history</CollapsibleLabel></summary><WeeklyHistory samples={snapshot.weeklyHistory ?? []} error={snapshot.historyError ?? accountError} now={now} /></details>
 
       {update?.availableVersion && <section className="tm-card tm-update-banner" aria-label="Update available"><DownloadSimple size={18} weight="fill" /><p>{update.status || `Version ${update.availableVersion} is available`}</p><button className="tm-button tm-primary" type="button" disabled={update.busy} onClick={update.onInstall}>Update Now</button><button className="tm-button" type="button" disabled={update.busy} onClick={update.onOpen}>Details</button></section>}
 
