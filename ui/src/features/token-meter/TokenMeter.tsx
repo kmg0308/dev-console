@@ -473,8 +473,13 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   useEffect(() => {
     if (!active) return;
     let stale = false;
+    let retry: number | undefined;
     async function refreshAccount() {
-      if (document.visibilityState !== "visible" || loadInFlight.current || accountRefreshInFlight.current || !currentSnapshot.current || currentSnapshot.current.codexAccount?.status === "updating") return;
+      window.clearTimeout(retry);
+      retry = undefined;
+      if (stale || document.visibilityState !== "visible" || accountRefreshInFlight.current || !currentSnapshot.current) return;
+      const latest = currentSnapshot.current.weeklyHistory?.at(-1);
+      if (latest && Math.floor(Date.parse(latest.fetchedAt) / 60_000) === Math.floor(Date.now() / 60_000)) return;
       accountRefreshInFlight.current = true;
       try {
         const account = await invoke<Pick<DashboardSnapshot, "codexAccount" | "weeklyHistory" | "historyError">>("token_meter_refresh_account");
@@ -482,6 +487,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
           accountVersion.current += 1;
           setAccountError(undefined);
           setSnapshot((current) => current ? { ...current, ...account, historyError: account.historyError } : current);
+          if (account.codexAccount?.status === "updating") retry = window.setTimeout(() => void refreshAccount(), 1_000);
         }
       } catch (reason) {
         if (!stale) setAccountError(errorMessage(reason));
@@ -495,6 +501,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
     return () => {
       stale = true;
       window.clearInterval(timer);
+      window.clearTimeout(retry);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, [active]);

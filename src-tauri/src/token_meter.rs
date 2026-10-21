@@ -50,6 +50,7 @@ struct DashboardData {
     loaded_after: Option<chrono::DateTime<Utc>>,
     account: DashboardAccountState,
     account_generation: u64,
+    account_query_in_flight: bool,
     history_error: Option<String>,
 }
 
@@ -124,6 +125,7 @@ pub fn initialize<R: Runtime>(app: &AppHandle<R>) -> Result<TokenMeterState, Str
             loaded_after: None,
             account: DashboardAccountState::Updating(None),
             account_generation: 0,
+            account_query_in_flight: false,
             history_error: None,
         })),
         cleanup_plan: Mutex::new(None),
@@ -471,13 +473,19 @@ impl TokenMeterState {
             .dashboard_data
             .lock()
             .map_err(|_| "TokenMeter dashboard cache lock is poisoned".to_owned())?;
-        data.account_generation = data.account_generation.wrapping_add(1);
         if self.source_isolation_root.is_some() {
+            data.account_generation = data.account_generation.wrapping_add(1);
+            data.account_query_in_flight = false;
             data.account = DashboardAccountState::Unavailable(
                 "Codex account access is disabled in updater QA.".to_owned(),
             );
             return Ok(None);
         }
+        if data.account_query_in_flight {
+            return Ok(None);
+        }
+        data.account_generation = data.account_generation.wrapping_add(1);
+        data.account_query_in_flight = true;
         let previous = match &data.account {
             DashboardAccountState::Available(usage)
             | DashboardAccountState::Updating(Some(usage)) => Some(usage.clone()),
@@ -530,6 +538,7 @@ impl TokenMeterState {
         data.scan = None;
         data.loaded_after = None;
         data.account_generation = data.account_generation.wrapping_add(1);
+        data.account_query_in_flight = false;
         Ok(())
     }
 
@@ -912,6 +921,7 @@ fn update_account_if_current(
     if data.account_generation != generation {
         return false;
     }
+    data.account_query_in_flight = false;
     if let DashboardAccountState::Available(usage) = &account
         && usage.seven_day_window.is_some()
     {
@@ -1277,6 +1287,7 @@ mod tests {
                 loaded_after: None,
                 account: DashboardAccountState::Updating(None),
                 account_generation: 0,
+                account_query_in_flight: false,
                 history_error: None,
             })),
             cleanup_plan: Mutex::new(None),
@@ -1560,6 +1571,71 @@ mod tests {
     }
 
     #[test]
+    fn log_refresh_and_account_refresh_share_the_running_account_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let generation = state.begin_account_refresh().unwrap().unwrap();
+        assert!(state.dashboard_data.lock().unwrap().account_query_in_flight);
+        assert_eq!(
+            state.refresh_account().unwrap().codex_account.status,
+            "updating"
+        );
+        state
+            .refresh_dashboard_data(
+                &state.load_settings().unwrap(),
+                false,
+                None,
+                None,
+                true,
+                || false,
+            )
+            .unwrap();
+        {
+            let data = state.dashboard_data.lock().unwrap();
+            assert!(data.scan.is_some());
+            assert_eq!(data.account_generation, generation);
+            assert!(data.account_query_in_flight);
+        }
+        assert!(update_account_if_current(
+            &state.dashboard_data,
+            generation,
+            DashboardAccountState::Available(weekly_account(42)),
+            &state.cache_path(),
+        ));
+        assert!(!state.dashboard_data.lock().unwrap().account_query_in_flight);
+        assert_eq!(state.account_snapshot().unwrap().weekly_history.len(), 1);
+        assert!(state.begin_account_refresh().unwrap().unwrap() > generation);
+    }
+
+    #[test]
+    fn invalidation_releases_query_and_stale_completion_cannot_release_its_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = state(directory.path());
+        let stale_generation = state.begin_account_refresh().unwrap().unwrap();
+        state.invalidate_dashboard_data().unwrap();
+        assert!(!state.dashboard_data.lock().unwrap().account_query_in_flight);
+        let generation = state.begin_account_refresh().unwrap().unwrap();
+        assert!(generation > stale_generation);
+        assert!(!update_account_if_current(
+            &state.dashboard_data,
+            stale_generation,
+            DashboardAccountState::Available(weekly_account(10)),
+            &state.cache_path(),
+        ));
+        assert!(!state.cache_path().exists());
+        assert!(state.dashboard_data.lock().unwrap().account_query_in_flight);
+        assert!(state.begin_account_refresh().unwrap().is_none());
+        assert!(update_account_if_current(
+            &state.dashboard_data,
+            generation,
+            DashboardAccountState::Unavailable("fixture failure".into()),
+            &state.cache_path(),
+        ));
+        assert!(!state.dashboard_data.lock().unwrap().account_query_in_flight);
+        assert!(state.begin_account_refresh().unwrap().is_some());
+    }
+
+    #[test]
     fn account_only_refresh_preserves_history_on_failure_without_scanning_sources() {
         let directory = tempfile::tempdir().unwrap();
         let state = state(directory.path());
@@ -1671,8 +1747,16 @@ mod tests {
     fn account_only_refresh_honors_updater_qa_isolation() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = state(directory.path());
+        let stale_generation = state.begin_account_refresh().unwrap().unwrap();
         state.source_isolation_root = Some(directory.path().join("sources"));
         assert!(state.begin_account_refresh().unwrap().is_none());
+        assert!(!state.dashboard_data.lock().unwrap().account_query_in_flight);
+        assert!(!update_account_if_current(
+            &state.dashboard_data,
+            stale_generation,
+            DashboardAccountState::Available(weekly_account(42)),
+            &state.cache_path(),
+        ));
         let snapshot = state.refresh_account().unwrap();
         assert_eq!(snapshot.codex_account.status, "unavailable");
         assert!(
@@ -1711,6 +1795,16 @@ mod tests {
             &state.dashboard_data.lock().unwrap().account,
             DashboardAccountState::Updating(None)
         ));
+        let generation = state.dashboard_data.lock().unwrap().account_generation;
+        assert_eq!(
+            state.refresh_account().unwrap().codex_account.status,
+            "updating"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            state.dashboard_data.lock().unwrap().account_generation,
+            generation
+        );
         let deadline = Instant::now() + Duration::from_secs(4);
         while matches!(
             &state.dashboard_data.lock().unwrap().account,

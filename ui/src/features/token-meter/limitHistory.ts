@@ -14,37 +14,58 @@ export function presetHistoryInterval(range: "1h" | "24h" | "7d", now: number): 
   return { start: Math.floor((now - duration) / HISTORY_MINUTE) * HISTORY_MINUTE, end: now };
 }
 
-export function minuteHistorySample(samples: WeeklyHistorySample[], minute: number): WeeklyHistorySample | undefined {
-  const selectedMinute = Math.floor(minute / HISTORY_MINUTE);
-  for (let index = samples.length - 1; index >= 0; index--) {
-    const sampleMinute = Math.floor(Date.parse(samples[index].fetchedAt) / HISTORY_MINUTE);
-    if (sampleMinute === selectedMinute) return samples[index];
-    if (sampleMinute < selectedMinute) break;
+export function nearestHistorySample(samples: WeeklyHistorySample[], at: number, interval: HistoryInterval): WeeklyHistorySample | undefined {
+  let nearest: WeeklyHistorySample | undefined;
+  let distance = Infinity;
+  let nearestAt = Infinity;
+  for (const sample of samples) {
+    const timestamp = Date.parse(sample.fetchedAt);
+    if (!(timestamp >= interval.start && timestamp <= interval.end)) continue;
+    const difference = Math.abs(timestamp - at);
+    if (difference < distance || (difference === distance && timestamp < nearestAt)) {
+      nearest = sample;
+      distance = difference;
+      nearestAt = timestamp;
+    }
   }
-  return undefined;
+  return nearest;
 }
 
-export function historyPath(samples: WeeklyHistorySample[], interval: HistoryInterval): string {
+export function historyPaths(samples: WeeklyHistorySample[], interval: HistoryInterval): { line: string; area: string; gaps: string } {
+  const paths = { line: "", area: "", gaps: "" };
   const duration = interval.end - interval.start;
-  if (!(duration > 0) || !Number.isFinite(duration)) return "";
-  let path = "";
-  let previous: WeeklyHistorySample | undefined;
-  let previousMinute: number | undefined;
+  if (!(duration > 0) || !Number.isFinite(duration)) return paths;
+  let segment = "";
+  let segmentStart = 0;
+  let segmentPoints = 0;
+  let previous: { timestamp: number; x: number; y: number; resetsAt: string } | undefined;
+
+  function finishSegment() {
+    if (!previous) return;
+    paths.line += `${paths.line ? " " : ""}${segment}${segmentPoints === 1 ? ` h ${previous.x <= 999.99 ? ".01" : "-.01"}` : ""}`;
+    if (segmentPoints > 1) paths.area += `${paths.area ? " " : ""}${segment} L ${previous.x} 178 L ${segmentStart} 178 Z`;
+  }
+
   for (const sample of samples) {
     const timestamp = Date.parse(sample.fetchedAt);
     if (!(timestamp >= interval.start && timestamp <= interval.end) || !Number.isFinite(sample.usedPercent)) continue;
-    const minute = Math.floor(timestamp / HISTORY_MINUTE);
     const x = (timestamp - interval.start) / duration * 1_000;
     const y = 178 - Math.max(0, Math.min(100, sample.usedPercent)) * 1.76;
-    if (previousMinute !== undefined && minute === previousMinute + 1 && sample.resetsAt === previous?.resetsAt) {
-      path += ` H ${x} V ${y}`;
+    const sameCycle = previous?.resetsAt === sample.resetsAt;
+    if (previous && sameCycle && timestamp - previous.timestamp <= 3 * HISTORY_MINUTE) {
+      segment += ` L ${x} ${y}`;
+      segmentPoints++;
     } else {
-      path += `${path ? " " : ""}M ${x} ${y} h ${x <= 999.99 ? ".01" : "-.01"}`;
+      finishSegment();
+      if (previous && sameCycle) paths.gaps += `${paths.gaps ? " " : ""}M ${previous.x} ${previous.y} L ${x} ${y}`;
+      segment = `M ${x} ${y}`;
+      segmentStart = x;
+      segmentPoints = 1;
     }
-    previous = sample;
-    previousMinute = minute;
+    previous = { timestamp, x, y, resetsAt: sample.resetsAt };
   }
-  return path;
+  finishSegment();
+  return paths;
 }
 
 export function localDateTimeInput(timestamp: number): string {
@@ -74,25 +95,36 @@ if (nodeProcess?.argv[1]?.replace(/\\/g, "/").endsWith("/limitHistory.ts")) {
   const reset = "2026-10-25T01:00:00Z";
   const samples: WeeklyHistorySample[] = [
     { fetchedAt: new Date(start + 15_000).toISOString(), usedPercent: 0, resetsAt: reset },
-    { fetchedAt: new Date(start + HISTORY_MINUTE + 15_000).toISOString(), usedPercent: 25, resetsAt: reset },
-    { fetchedAt: new Date(start + 3 * HISTORY_MINUTE).toISOString(), usedPercent: 50, resetsAt: reset },
-    { fetchedAt: new Date(start + 4 * HISTORY_MINUTE).toISOString(), usedPercent: 100, resetsAt: "2026-11-01T01:00:00Z" },
+    { fetchedAt: new Date(start + 2 * HISTORY_MINUTE + 15_000).toISOString(), usedPercent: 25, resetsAt: reset },
+    { fetchedAt: new Date(start + 8 * HISTORY_MINUTE + 15_000).toISOString(), usedPercent: 50, resetsAt: reset },
+    { fetchedAt: new Date(start + 9 * HISTORY_MINUTE + 15_000).toISOString(), usedPercent: 100, resetsAt: "2026-11-01T01:00:00Z" },
   ];
-  check(minuteHistorySample(samples, start + HISTORY_MINUTE + 59_999) === samples[1], "select the same minute");
-  check(minuteHistorySample(samples, start + 2 * HISTORY_MINUTE) === undefined, "do not fill a missing minute");
-  check(minuteHistorySample(samples, start - HISTORY_MINUTE) === undefined, "no earlier sample");
-  check(minuteHistorySample([], start) === undefined, "empty history");
-  const newer = { ...samples[0], fetchedAt: new Date(start + 50_000).toISOString(), usedPercent: 10 };
-  check(minuteHistorySample([samples[0], newer], start) === newer, "choose the latest duplicate minute");
+  const original = JSON.stringify(samples);
+  const interval = { start, end: start + 10 * HISTORY_MINUTE };
+  check(nearestHistorySample(samples, start + 2 * HISTORY_MINUTE, interval) === samples[1], "snap to the actual nearest timestamp");
+  check(nearestHistorySample(samples, start + HISTORY_MINUTE + 15_000, interval) === samples[0], "prefer the earlier timestamp on a tie");
+  check(nearestHistorySample(samples, start - HISTORY_MINUTE, interval) === samples[0], "snap to the first record");
+  check(nearestHistorySample(samples, interval.end + HISTORY_MINUTE, interval) === samples[3], "snap to the last record");
+  check(nearestHistorySample(samples, start, { start: start + HISTORY_MINUTE, end: interval.end }) === samples[1], "exclude earlier out-of-range records");
+  check(nearestHistorySample(samples, interval.end, { start, end: start + 8 * HISTORY_MINUTE }) === samples[1], "exclude later out-of-range records");
+  check(nearestHistorySample(samples, start, { start: start + 3 * HISTORY_MINUTE, end: start + 4 * HISTORY_MINUTE }) === undefined, "empty selected range");
+  check(nearestHistorySample([], start, interval) === undefined, "empty history");
+  const recordedAt = Date.parse(samples[1].fetchedAt);
+  check(nearestHistorySample(samples, recordedAt, { start: recordedAt, end: recordedAt + HISTORY_MINUTE }) === samples[1], "include the range start");
+  check(nearestHistorySample(samples, recordedAt, { start: recordedAt - HISTORY_MINUTE, end: recordedAt }) === samples[1], "include the range end");
 
-  const path = historyPath(samples, { start, end: start + 5 * HISTORY_MINUTE });
-  check((path.match(/M /g) ?? []).length === 3, "break paths at missing minutes and resets");
-  check(path.startsWith("M 50 178 h .01 H 250 V 134"), "use actual timestamps and step after");
-  check(path.includes("M 800 2 h .01"), "100 percent maps to the top");
-  check(historyPath([samples[0]], { start, end: start + 5 * HISTORY_MINUTE }).includes("h .01"), "show an isolated sample");
-  check(historyPath(samples, { start: start + 2 * HISTORY_MINUTE, end: start + 3 * HISTORY_MINUTE }) === "M 1000 90 h -.01", "exclude samples outside the range and keep the endpoint inside the chart");
-  check(historyPath([], { start, end: now }) === "", "empty path");
-  check(historyPath(samples, { start: now, end: start }) === "", "invalid path interval");
+  const paths = historyPaths(samples, interval);
+  check(paths.line === "M 25 178 L 225 134 M 825 90 h .01 M 925 2 h .01", "connect a 120-second delay but separate long gaps and resets");
+  check(paths.gaps === "M 225 134 L 825 90", "only the long same-cycle gap has a separate path");
+  check(paths.area === "M 25 178 L 225 134 L 225 178 L 25 178 Z", "fill only solid multi-point segments to the baseline");
+  const exactBoundary = { ...samples[1], fetchedAt: new Date(start + 3 * HISTORY_MINUTE + 15_000).toISOString() };
+  check(historyPaths([samples[0], exactBoundary], interval).gaps === "", "three minutes is still solid");
+  check(historyPaths([samples[0], { ...exactBoundary, fetchedAt: new Date(start + 3 * HISTORY_MINUTE + 15_001).toISOString() }], interval).gaps !== "", "more than three minutes is a gap");
+  const isolated = historyPaths(samples, { start: recordedAt - HISTORY_MINUTE, end: recordedAt });
+  check(isolated.line === "M 1000 134 h -.01" && isolated.area === "" && isolated.gaps === "", "exclude outside records and show the isolated endpoint without fill");
+  check(Object.values(historyPaths([], interval)).every((path) => path === ""), "empty paths");
+  check(Object.values(historyPaths(samples, { start: now, end: start })).every((path) => path === ""), "invalid path interval");
+  check(JSON.stringify(samples) === original, "do not modify or invent samples");
 
   const earliest = Math.floor((now - HISTORY_DURATION) / HISTORY_MINUTE) * HISTORY_MINUTE;
   check(validHistoryInterval(earliest, now, now), "accept the seven-day boundary minute");
