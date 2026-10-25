@@ -184,23 +184,73 @@ fn resolve_macos_account_executable_from(
 
 #[cfg(target_os = "windows")]
 fn resolve_windows_account_executable() -> Result<PathBuf, CodexAccountUsageServiceError> {
-    let path = env::var_os("PATH").ok_or(CodexAccountUsageServiceError::ExecutableNotFound)?;
-    let extensions =
-        env::var_os("PATHEXT").ok_or(CodexAccountUsageServiceError::ExecutableNotFound)?;
-    let extensions = extensions.to_string_lossy();
+    let extensions = env::var_os("PATHEXT")
+        .map(|extensions| extensions.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".EXE;.CMD;.BAT".to_owned());
 
-    for directory in env::split_paths(&path).filter(|directory| directory.is_absolute()) {
-        for extension in extensions.split(';').filter_map(account_extension) {
-            let candidate = directory.join(format!("codex.{extension}"));
-            if regular_non_reparse(&candidate)
-                && let Ok(candidate) = fs::canonicalize(candidate)
-                && regular_non_reparse(&candidate)
-            {
-                return Ok(candidate);
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path).filter(|directory| directory.is_absolute()) {
+            for extension in extensions.split(';').filter_map(account_extension) {
+                let candidate = directory.join(format!("codex.{extension}"));
+                if regular_non_reparse(&candidate)
+                    && let Ok(candidate) = fs::canonicalize(candidate)
+                    && regular_non_reparse(&candidate)
+                {
+                    return Ok(candidate);
+                }
             }
         }
     }
+
+    if let Some(candidate) = resolve_bundled_windows_codex() {
+        return Ok(candidate);
+    }
+
     Err(CodexAccountUsageServiceError::ExecutableNotFound)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_bundled_windows_codex() -> Option<PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    use std::time::UNIX_EPOCH;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let root = PathBuf::from(env::var_os("LOCALAPPDATA")?)
+        .join("OpenAI")
+        .join("Codex")
+        .join("bin");
+    let root_metadata = fs::symlink_metadata(&root).ok()?;
+    if !root_metadata.is_dir()
+        || root_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return None;
+    }
+
+    let mut candidates = fs::read_dir(root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let directory = entry.path();
+            let metadata = fs::symlink_metadata(&directory).ok()?;
+            if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            {
+                return None;
+            }
+
+            let executable = directory.join("codex.exe");
+            if !regular_non_reparse(&executable) {
+                return None;
+            }
+            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+            Some((modified, executable))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.into_iter().find_map(|(_, candidate)| {
+        let candidate = fs::canonicalize(candidate).ok()?;
+        regular_non_reparse(&candidate).then_some(candidate)
+    })
 }
 
 #[cfg(target_os = "windows")]

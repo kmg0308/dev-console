@@ -205,9 +205,10 @@ fn main() {
         println!("{identifier}\n{}", data_directory.display());
         return;
     }
+    let updater_available = updater::updater_configured(context.config().plugins.0.get("updater"));
     let builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
     let builder = builder
-        .menu(|app| {
+        .menu(move |app| {
             let menu = Menu::default(app)?;
             #[cfg(target_os = "macos")]
             let update_menu = menu.items()?.into_iter().next();
@@ -228,16 +229,18 @@ fn main() {
                         insert_at,
                     )?;
                 }
-                update_menu.insert(
-                    &MenuItem::with_id(
-                        app,
-                        "check-for-updates",
-                        "Check for Updates…",
-                        true,
-                        None::<&str>,
-                    )?,
-                    insert_at + usize::from(cfg!(feature = "runtime-atlas")),
-                )?;
+                if updater_available {
+                    update_menu.insert(
+                        &MenuItem::with_id(
+                            app,
+                            "check-for-updates",
+                            "Check for Updates…",
+                            true,
+                            None::<&str>,
+                        )?,
+                        insert_at + usize::from(cfg!(feature = "runtime-atlas")),
+                    )?;
+                }
             }
             Ok(menu)
         })
@@ -250,7 +253,7 @@ fn main() {
                 let _ = app.emit("app:open-runtime-atlas-settings", ());
             }
         });
-    let builder = if updater::updater_configured(context.config().plugins.0.get("updater")) {
+    let builder = if updater_available {
         builder.plugin(tauri_plugin_updater::Builder::new().build())
     } else {
         builder

@@ -5,7 +5,7 @@
 ## 어떤 앱을 받으면 되나요?
 
 - **TokenMeter**: Codex, Claude Code, Hermes Agent의 토큰 사용량과 Codex 사용 한도를 확인합니다.
-- **Runtime Atlas**: Git 저장소와 작업 폴더별 프로세스, 포트, Docker 컨테이너를 확인하고 등록한 명령을 실행합니다.
+- **Runtime Atlas**: Git 저장소를 여러 개 등록해 각 저장소의 워크트리, 프로세스, 포트, Docker 컨테이너를 확인하고 명령을 실행합니다. 사이드바의 `저장소 추가`를 사용하며, 사용자 지정 명령은 저장소마다 설정합니다.
 - **DevConsole**: TokenMeter와 Runtime Atlas를 한 앱에서 사용합니다.
 
 TokenMeter의 `7 day usage history`는 화면이 활성화되고 보이는 동안 Codex 계정 사용률을 1분마다 로컬에 기록해 최근 7일을 보여줍니다. 조회 범위를 선택하거나 차트에서 구간을 드래그해 확대할 수 있으며, 시각을 선택하면 가장 가까운 실제 기록과 그 시각을 표시합니다. 3분을 넘는 수집 공백은 점선으로 구분하고 리셋 경계는 연결하지 않습니다.
