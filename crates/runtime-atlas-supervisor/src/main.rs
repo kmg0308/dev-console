@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 use serde::Serialize;
 use std::{
     ffi::OsString,
@@ -1066,7 +1068,7 @@ mod platform {
                 AllocConsole, CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT,
                 CTRL_SHUTDOWN_EVENT, GenerateConsoleCtrlEvent, GetConsoleCP, GetConsoleWindow,
                 GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-                SetConsoleCtrlHandler,
+                SetConsoleCtrlHandler, SetStdHandle,
             },
             Environment::GetEnvironmentVariableW,
             JobObjects::{
@@ -1170,12 +1172,22 @@ mod platform {
 
     fn ensure_console() -> io::Result<()> {
         if unsafe { GetConsoleCP() } == 0 {
+            let standard_handles = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+                .map(|kind| (kind, unsafe { GetStdHandle(kind) }));
             if unsafe { AllocConsole() } == 0 {
                 return Err(io::Error::last_os_error());
             }
             let window = unsafe { GetConsoleWindow() };
             if !window.is_null() {
                 unsafe { ShowWindow(window, SW_HIDE) };
+            }
+            for (kind, handle) in standard_handles {
+                if !handle.is_null()
+                    && handle != INVALID_HANDLE_VALUE
+                    && unsafe { SetStdHandle(kind, handle) } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
             }
         }
         Ok(())
