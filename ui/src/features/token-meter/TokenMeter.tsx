@@ -332,7 +332,7 @@ function CollapsibleLabel({ children }: { children: ReactNode }) {
   return <><CaretRight className="tm-collapsed-icon" weight="bold" /><CaretDown className="tm-expanded-icon" weight="bold" /><span>{children}</span></>;
 }
 
-export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; active: boolean }) {
+export function TokenMeter({ update }: { update?: TokenMeterUpdate }) {
   const [source, setSource] = useState<TokenSource>("all");
   const [sourceOpen, setSourceOpen] = useState(false);
   const [range, setRange] = useState("8h");
@@ -361,9 +361,6 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   const [now, setNow] = useState(Date.now());
   const loadInFlight = useRef(false);
   const pendingLoad = useRef(false);
-  const wasActive = useRef(false);
-  const activeRef = useRef(active);
-  activeRef.current = active;
   const currentSnapshot = useRef(snapshot);
   currentSnapshot.current = snapshot;
   const accountRefreshInFlight = useRef(false);
@@ -375,16 +372,6 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
   }
 
   useEffect(() => {
-    if (!active) {
-      wasActive.current = false;
-      void invoke("token_meter_cancel_dashboard_refresh").catch(() => undefined);
-      return;
-    }
-    if (!wasActive.current) {
-      wasActive.current = true;
-      if (snapshot) refreshRequested.current = true;
-      else refreshAfterLoad.current = true;
-    }
     if (loadInFlight.current) {
       pendingLoad.current = true;
       return;
@@ -444,22 +431,21 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       .finally(() => {
         loadInFlight.current = false;
         if (!stale) setLoading(false);
-        if (pendingLoad.current && activeRef.current) {
+        if (pendingLoad.current) {
           pendingLoad.current = false;
           setReload((value) => value + 1);
         }
       });
     return () => { stale = true; };
-  }, [active, source, range, bucket, project, model, device, reload]);
+  }, [source, range, bucket, project, model, device, reload]);
 
   useEffect(() => {
-    if (!active || snapshot?.codexAccount?.status !== "updating") return;
+    if (snapshot?.codexAccount?.status !== "updating") return;
     const timer = window.setTimeout(() => setReload((value) => value + 1), 1_000);
     return () => window.clearTimeout(timer);
-  }, [active, snapshot?.codexAccount?.status, snapshot?.generatedAt]);
+  }, [snapshot?.codexAccount?.status, snapshot?.generatedAt]);
 
   useEffect(() => {
-    if (!active) return;
     const refreshTimer = window.setInterval(() => {
       if (document.visibilityState === "visible" && !loadInFlight.current) refreshDashboard();
     }, 5 * 60_000);
@@ -468,10 +454,9 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       window.clearInterval(refreshTimer);
       window.clearInterval(clockTimer);
     };
-  }, [active]);
+  }, []);
 
   useEffect(() => {
-    if (!active) return;
     let stale = false;
     let retry: number | undefined;
     async function refreshAccount() {
@@ -504,7 +489,7 @@ export function TokenMeter({ update, active }: { update?: TokenMeterUpdate; acti
       window.clearTimeout(retry);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [active]);
+  }, []);
 
   async function previewCleanup() {
     setAction({ kind: "working", scope: "sources", message: "Checking old sessions…" });

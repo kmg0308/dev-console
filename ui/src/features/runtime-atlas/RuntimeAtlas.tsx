@@ -56,7 +56,7 @@ type RuntimeAtlasUpdate = {
   onInstall: () => void;
 };
 
-export function RuntimeAtlas({ update, active }: { update?: RuntimeAtlasUpdate; active: boolean }) {
+export function RuntimeAtlas({ update }: { update?: RuntimeAtlasUpdate }) {
   const [snapshot, setSnapshot] = useState<RuntimeAtlasSnapshot>();
   const [selectedPath, setSelectedPath] = useState<string>();
   const [error, setError] = useState<string>();
@@ -111,11 +111,10 @@ export function RuntimeAtlas({ update, active }: { update?: RuntimeAtlasUpdate; 
   }, [enqueue, loadStatus]);
 
   useEffect(() => {
-    if (!active) return;
     void refresh();
     const timer = window.setInterval(() => void refresh(), 60_000);
     return () => window.clearInterval(timer);
-  }, [active, refresh]);
+  }, [refresh]);
 
   useEffect(() => {
     selectedPathRef.current = selectedPath;

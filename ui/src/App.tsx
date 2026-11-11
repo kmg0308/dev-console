@@ -283,12 +283,12 @@ export function App() {
       )}
       {identity.features.includes("tokenMeter") && (
         <div hidden={selected !== "tokenMeter"} aria-hidden={selected !== "tokenMeter"}>
-          <TokenMeter active={selected === "tokenMeter"} update={standaloneUpdate} />
+          <TokenMeter update={standaloneUpdate} />
         </div>
       )}
       {identity.features.includes("runtimeAtlas") && (
         <div hidden={selected !== "runtimeAtlas"} aria-hidden={selected !== "runtimeAtlas"}>
-          <RuntimeAtlas active={selected === "runtimeAtlas"} update={standaloneUpdate} />
+          <RuntimeAtlas update={standaloneUpdate} />
         </div>
       )}
       <dialog
